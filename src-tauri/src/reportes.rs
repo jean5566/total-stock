@@ -8,10 +8,11 @@
 
 use std::collections::HashMap;
 
-use rusqlite::{params, Connection};
+use libsql::{params, Connection, Row};
 use rust_xlsxwriter::{Color, Format, FormatBorder, Workbook, XlsxError};
 use serde::{Deserialize, Serialize};
 
+use super::db::{fila, filas, FilaExt};
 use super::{a_centavos, de_centavos, requerir_conexion, sanear_nombre_archivo, AppState};
 
 // Rangos de más de estos días se agrupan por mes en el gráfico y en los impuestos.
@@ -150,26 +151,27 @@ pub struct Reporte {
 }
 
 #[tauri::command]
-pub fn obtener_reporte(
+pub async fn obtener_reporte(
     state: tauri::State<'_, AppState>,
     desde: String,
     hasta: String,
 ) -> Result<Reporte, String> {
-    let conn_guard = state.db.lock().unwrap();
-    let conn = requerir_conexion(&conn_guard)?;
-    validar_rango(conn, &desde, &hasta)?;
-    construir_reporte(conn, &desde, &hasta).map_err(|e| e.to_string())
+    let guard = state.db.lock().await;
+    let conn = requerir_conexion(&guard)?;
+    validar_rango(conn, &desde, &hasta).await?;
+    construir_reporte(conn, &desde, &hasta).await.map_err(|e| e.to_string())
 }
 
 // Fechas AAAA-MM-DD válidas, desde <= hasta y un rango razonable.
-fn validar_rango(conn: &Connection, desde: &str, hasta: &str) -> Result<(), String> {
-    let (ok_desde, ok_hasta, dias): (bool, bool, Option<f64>) = conn
-        .query_row(
-            "SELECT date(?1) IS ?1, date(?2) IS ?2, julianday(?2) - julianday(?1)",
-            params![desde, hasta],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .map_err(|e| e.to_string())?;
+async fn validar_rango(conn: &Connection, desde: &str, hasta: &str) -> Result<(), String> {
+    let (ok_desde, ok_hasta, dias): (bool, bool, Option<f64>) = fila(
+        conn,
+        "SELECT date(?1) IS ?1, date(?2) IS ?2, julianday(?2) - julianday(?1)",
+        params![desde, hasta],
+        |row| Ok((row.col(0)?, row.col(1)?, row.col(2)?)),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     if !ok_desde || !ok_hasta {
         return Err("Las fechas del reporte no son válidas.".to_string());
     }
@@ -180,15 +182,17 @@ fn validar_rango(conn: &Connection, desde: &str, hasta: &str) -> Result<(), Stri
     }
 }
 
-fn construir_reporte(conn: &Connection, desde: &str, hasta: &str) -> rusqlite::Result<Reporte> {
+async fn construir_reporte(conn: &Connection, desde: &str, hasta: &str) -> libsql::Result<Reporte> {
     // Período anterior de la misma duración, justo antes del actual.
-    let (dias, anterior_desde, anterior_hasta): (i64, String, String) = conn.query_row(
+    let (dias, anterior_desde, anterior_hasta): (i64, String, String) = fila(
+        conn,
         "SELECT CAST(julianday(?2) - julianday(?1) AS INTEGER) + 1,
                 date(?1, printf('-%d days', CAST(julianday(?2) - julianday(?1) AS INTEGER) + 1)),
                 date(?1, '-1 day')",
         params![desde, hasta],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    )?;
+        |row| Ok((row.col(0)?, row.col(1)?, row.col(2)?)),
+    )
+    .await?;
     let por_mes = dias > MAX_DIAS_AGRUPAR_POR_DIA;
 
     let impuestos_ventas = desglose(
@@ -198,7 +202,8 @@ fn construir_reporte(conn: &Connection, desde: &str, hasta: &str) -> rusqlite::R
          FROM ventas WHERE date(fecha) BETWEEN ?1 AND ?2",
         desde,
         hasta,
-    )?;
+    )
+    .await?;
     let impuestos_devoluciones = desglose(
         conn,
         "SELECT COALESCE(SUM(subtotal_cero), 0), COALESCE(SUM(subtotal_iva5), 0), COALESCE(SUM(subtotal_iva15), 0),
@@ -206,69 +211,81 @@ fn construir_reporte(conn: &Connection, desde: &str, hasta: &str) -> rusqlite::R
          FROM devoluciones WHERE date(fecha) BETWEEN ?1 AND ?2",
         desde,
         hasta,
-    )?;
+    )
+    .await?;
 
     Ok(Reporte {
         desde: desde.to_string(),
         hasta: hasta.to_string(),
-        resumen: resumen(conn, desde, hasta)?,
-        anterior: resumen(conn, &anterior_desde, &anterior_hasta)?,
+        resumen: resumen(conn, desde, hasta).await?,
+        anterior: resumen(conn, &anterior_desde, &anterior_hasta).await?,
         anterior_desde,
         anterior_hasta,
         agrupacion: if por_mes { "mes" } else { "dia" }.to_string(),
-        serie: serie(conn, desde, hasta, por_mes)?,
-        por_hora: distribucion(conn, desde, hasta, "%H")?,
-        por_dia_semana: distribucion(conn, desde, hasta, "%w")?,
-        productos: productos(conn, desde, hasta)?,
-        clientes: clientes(conn, desde, hasta)?,
+        serie: serie(conn, desde, hasta, por_mes).await?,
+        por_hora: distribucion(conn, desde, hasta, "%H").await?,
+        por_dia_semana: distribucion(conn, desde, hasta, "%w").await?,
+        productos: productos(conn, desde, hasta).await?,
+        clientes: clientes(conn, desde, hasta).await?,
         impuestos_neto: impuestos_ventas.restar(&impuestos_devoluciones),
         impuestos_ventas,
         impuestos_devoluciones,
-        devoluciones: devoluciones(conn, desde, hasta)?,
+        devoluciones: devoluciones(conn, desde, hasta).await?,
     })
 }
 
-fn desglose(conn: &Connection, sql: &str, desde: &str, hasta: &str) -> rusqlite::Result<Desglose> {
-    conn.query_row(sql, params![desde, hasta], |row| {
-        Ok(Desglose {
-            subtotal_cero: monto(row.get(0)?),
-            subtotal_iva5: monto(row.get(1)?),
-            subtotal_iva15: monto(row.get(2)?),
-            iva5: monto(row.get(3)?),
-            iva15: monto(row.get(4)?),
-            total: monto(row.get(5)?),
-        })
+fn mapear_desglose(row: &Row, desde_columna: i32) -> libsql::Result<Desglose> {
+    let c = desde_columna;
+    Ok(Desglose {
+        subtotal_cero: monto(row.col(c)?),
+        subtotal_iva5: monto(row.col(c + 1)?),
+        subtotal_iva15: monto(row.col(c + 2)?),
+        iva5: monto(row.col(c + 3)?),
+        iva15: monto(row.col(c + 4)?),
+        total: monto(row.col(c + 5)?),
     })
 }
 
-fn resumen(conn: &Connection, desde: &str, hasta: &str) -> rusqlite::Result<ResumenReporte> {
-    let (ventas, ventas_brutas, descuentos, credito_aplicado, clientes): (i64, f64, f64, f64, i64) = conn.query_row(
+async fn desglose(conn: &Connection, sql: &str, desde: &str, hasta: &str) -> libsql::Result<Desglose> {
+    fila(conn, sql, params![desde, hasta], |row| mapear_desglose(row, 0)).await
+}
+
+async fn resumen(conn: &Connection, desde: &str, hasta: &str) -> libsql::Result<ResumenReporte> {
+    let (ventas, ventas_brutas, descuentos, credito_aplicado, clientes): (i64, f64, f64, f64, i64) = fila(
+        conn,
         "SELECT COUNT(*), COALESCE(SUM(total), 0), COALESCE(SUM(descuento), 0), COALESCE(SUM(credito), 0),
                 COUNT(DISTINCT cliente_id)
          FROM ventas WHERE date(fecha) BETWEEN ?1 AND ?2",
         params![desde, hasta],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
-    )?;
-    let unidades: i64 = conn.query_row(
+        |row| Ok((row.col(0)?, row.col(1)?, row.col(2)?, row.col(3)?, row.col(4)?)),
+    )
+    .await?;
+    let unidades: i64 = fila(
+        conn,
         "SELECT COALESCE(SUM(d.cantidad), 0) FROM venta_detalle d JOIN ventas v ON v.id = d.venta_id
          WHERE date(v.fecha) BETWEEN ?1 AND ?2",
         params![desde, hasta],
-        |row| row.get(0),
-    )?;
-    let (devoluciones, monto_devuelto, reembolsado_efectivo): (i64, f64, f64) = conn.query_row(
+        |row| row.col(0),
+    )
+    .await?;
+    let (devoluciones, monto_devuelto, reembolsado_efectivo): (i64, f64, f64) = fila(
+        conn,
         "SELECT COUNT(*), COALESCE(SUM(total), 0),
                 COALESCE(SUM(CASE WHEN reembolso = 'EFECTIVO' THEN total ELSE 0 END), 0)
          FROM devoluciones WHERE date(fecha) BETWEEN ?1 AND ?2",
         params![desde, hasta],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    )?;
-    let unidades_devueltas: i64 = conn.query_row(
+        |row| Ok((row.col(0)?, row.col(1)?, row.col(2)?)),
+    )
+    .await?;
+    let unidades_devueltas: i64 = fila(
+        conn,
         "SELECT COALESCE(SUM(dd.cantidad), 0) FROM devolucion_detalle dd
          JOIN devoluciones dv ON dv.id = dd.devolucion_id
          WHERE date(dv.fecha) BETWEEN ?1 AND ?2",
         params![desde, hasta],
-        |row| row.get(0),
-    )?;
+        |row| row.col(0),
+    )
+    .await?;
 
     let brutas = a_centavos(ventas_brutas);
     let netas = brutas - a_centavos(monto_devuelto);
@@ -290,7 +307,7 @@ fn resumen(conn: &Connection, desde: &str, hasta: &str) -> rusqlite::Result<Resu
 }
 
 // Un punto por cada día (o mes) del rango, incluidos los que no tuvieron movimiento.
-fn serie(conn: &Connection, desde: &str, hasta: &str, por_mes: bool) -> rusqlite::Result<Vec<PuntoSerie>> {
+async fn serie(conn: &Connection, desde: &str, hasta: &str, por_mes: bool) -> libsql::Result<Vec<PuntoSerie>> {
     let (claves_sql, formato) = if por_mes {
         (
             "WITH RECURSIVE k(d) AS (
@@ -307,39 +324,23 @@ fn serie(conn: &Connection, desde: &str, hasta: &str, por_mes: bool) -> rusqlite
             "%Y-%m-%d",
         )
     };
-    let claves: Vec<String> = conn
-        .prepare(claves_sql)?
-        .query_map(params![desde, hasta], |row| row.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
+    let claves: Vec<String> = filas(conn, claves_sql, params![desde, hasta], |row| row.col(0)).await?;
 
     // (cantidad de ventas, desglose) por período, de ventas y de devoluciones
-    let agrupar = |tabla: &str| -> rusqlite::Result<HashMap<String, (i64, Desglose)>> {
+    let agrupar = async |tabla: &str| -> libsql::Result<HashMap<String, (i64, Desglose)>> {
         let sql = format!(
             "SELECT strftime('{formato}', fecha), COUNT(*),
                     SUM(subtotal_cero), SUM(subtotal_iva5), SUM(subtotal_iva15), SUM(iva5), SUM(iva15), SUM(total)
              FROM {tabla} WHERE date(fecha) BETWEEN ?1 AND ?2 GROUP BY 1"
         );
-        let mut stmt = conn.prepare(&sql)?;
-        let filas = stmt.query_map(params![desde, hasta], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                (
-                    row.get::<_, i64>(1)?,
-                    Desglose {
-                        subtotal_cero: monto(row.get(2)?),
-                        subtotal_iva5: monto(row.get(3)?),
-                        subtotal_iva15: monto(row.get(4)?),
-                        iva5: monto(row.get(5)?),
-                        iva15: monto(row.get(6)?),
-                        total: monto(row.get(7)?),
-                    },
-                ),
-            ))
-        })?;
-        filas.collect()
+        let grupos = filas(conn, &sql, params![desde, hasta], |row| {
+            Ok((row.col::<String>(0)?, (row.col::<i64>(1)?, mapear_desglose(row, 2)?)))
+        })
+        .await?;
+        Ok(grupos.into_iter().collect())
     };
-    let ventas = agrupar("ventas")?;
-    let devoluciones = agrupar("devoluciones")?;
+    let ventas = agrupar("ventas").await?;
+    let devoluciones = agrupar("devoluciones").await?;
 
     Ok(claves
         .into_iter()
@@ -358,26 +359,31 @@ fn serie(conn: &Connection, desde: &str, hasta: &str, por_mes: bool) -> rusqlite
 }
 
 // Ventas por hora del día ("%H") o por día de la semana ("%w"). Solo las claves con ventas.
-fn distribucion(conn: &Connection, desde: &str, hasta: &str, formato: &str) -> rusqlite::Result<Vec<Distribucion>> {
+async fn distribucion(
+    conn: &Connection,
+    desde: &str,
+    hasta: &str,
+    formato: &str,
+) -> libsql::Result<Vec<Distribucion>> {
     let sql = format!(
         "SELECT CAST(strftime('{formato}', fecha) AS INTEGER), COUNT(*), SUM(total)
          FROM ventas WHERE date(fecha) BETWEEN ?1 AND ?2 GROUP BY 1 ORDER BY 1"
     );
-    let mut stmt = conn.prepare(&sql)?;
-    let filas = stmt.query_map(params![desde, hasta], |row| {
+    filas(conn, &sql, params![desde, hasta], |row| {
         Ok(Distribucion {
-            clave: row.get(0)?,
-            ventas: row.get(1)?,
-            monto: monto(row.get(2)?),
+            clave: row.col(0)?,
+            ventas: row.col(1)?,
+            monto: monto(row.col(2)?),
         })
-    })?;
-    filas.collect()
+    })
+    .await
 }
 
-fn productos(conn: &Connection, desde: &str, hasta: &str) -> rusqlite::Result<Vec<ReporteProducto>> {
+async fn productos(conn: &Connection, desde: &str, hasta: &str) -> libsql::Result<Vec<ReporteProducto>> {
     // Líneas vendidas en el rango y líneas devueltas en el rango, juntas por producto.
     // La categoría es la actual del producto (las líneas no la guardan).
-    let mut stmt = conn.prepare(
+    filas(
+        conn,
         "WITH mov AS (
              SELECT d.producto_id, d.codigo, d.detalle, d.venta_id AS venta, d.cantidad AS uv, 0 AS ud,
                     d.subtotal AS mv, 0 AS md
@@ -393,25 +399,27 @@ fn productos(conn: &Connection, desde: &str, hasta: &str) -> rusqlite::Result<Ve
          FROM mov m LEFT JOIN productos p ON p.id = m.producto_id
          GROUP BY m.producto_id
          ORDER BY neto DESC, SUM(m.uv) DESC",
-    )?;
-    let filas = stmt.query_map(params![desde, hasta], |row| {
-        Ok(ReporteProducto {
-            codigo: row.get(0)?,
-            detalle: row.get(1)?,
-            categoria: row.get(2)?,
-            ventas: row.get(3)?,
-            unidades_vendidas: row.get(4)?,
-            unidades_devueltas: row.get(5)?,
-            monto_neto: monto(row.get(6)?),
-        })
-    })?;
-    filas.collect()
+        params![desde, hasta],
+        |row| {
+            Ok(ReporteProducto {
+                codigo: row.col(0)?,
+                detalle: row.col(1)?,
+                categoria: row.col(2)?,
+                ventas: row.col(3)?,
+                unidades_vendidas: row.col(4)?,
+                unidades_devueltas: row.col(5)?,
+                monto_neto: monto(row.col(6)?),
+            })
+        },
+    )
+    .await
 }
 
-fn clientes(conn: &Connection, desde: &str, hasta: &str) -> rusqlite::Result<Vec<ReporteCliente>> {
+async fn clientes(conn: &Connection, desde: &str, hasta: &str) -> libsql::Result<Vec<ReporteCliente>> {
     // Sin cliente = consumidor final (clave 0). Las devoluciones se atribuyen al cliente de la
     // venta original. El nombre e identificación son los guardados en la venta más reciente.
-    let mut stmt = conn.prepare(
+    filas(
+        conn,
         "WITH mov AS (
              SELECT COALESCE(cliente_id, 0) AS cli, cliente_nombre AS nombre,
                     cliente_identificacion AS ident, fecha, 1 AS compra, total AS mv, 0 AS md
@@ -427,27 +435,29 @@ fn clientes(conn: &Connection, desde: &str, hasta: &str) -> rusqlite::Result<Vec
                 SUM(compra), SUM(mv), SUM(md), MAX(fecha)
          FROM mov GROUP BY cli
          ORDER BY SUM(mv) - SUM(md) DESC",
-    )?;
-    let filas = stmt.query_map(params![desde, hasta], |row| {
-        let cliente: i64 = row.get(0)?;
-        let total_compras = a_centavos(row.get(4)?);
-        let devoluciones = a_centavos(row.get(5)?);
-        let nombre: String = row.get(1)?;
-        Ok(ReporteCliente {
-            nombre: if cliente == 0 || nombre.is_empty() { "CONSUMIDOR FINAL".to_string() } else { nombre },
-            identificacion: if cliente == 0 { String::new() } else { row.get(2)? },
-            compras: row.get(3)?,
-            total_compras: de_centavos(total_compras),
-            devoluciones: de_centavos(devoluciones),
-            neto: de_centavos(total_compras - devoluciones),
-            ultima_compra: row.get(6)?,
-        })
-    })?;
-    filas.collect()
+        params![desde, hasta],
+        |row| {
+            let cliente: i64 = row.col(0)?;
+            let total_compras = a_centavos(row.col(4)?);
+            let devoluciones = a_centavos(row.col(5)?);
+            let nombre: String = row.col(1)?;
+            Ok(ReporteCliente {
+                nombre: if cliente == 0 || nombre.is_empty() { "CONSUMIDOR FINAL".to_string() } else { nombre },
+                identificacion: if cliente == 0 { String::new() } else { row.col(2)? },
+                compras: row.col(3)?,
+                total_compras: de_centavos(total_compras),
+                devoluciones: de_centavos(devoluciones),
+                neto: de_centavos(total_compras - devoluciones),
+                ultima_compra: row.col(6)?,
+            })
+        },
+    )
+    .await
 }
 
-fn devoluciones(conn: &Connection, desde: &str, hasta: &str) -> rusqlite::Result<Vec<ReporteDevolucion>> {
-    let mut stmt = conn.prepare(
+async fn devoluciones(conn: &Connection, desde: &str, hasta: &str) -> libsql::Result<Vec<ReporteDevolucion>> {
+    filas(
+        conn,
         "SELECT dv.id, dv.venta_id, dv.fecha, dv.motivo, dv.reembolso, COALESCE(v.cliente_nombre, ''),
                 (SELECT COALESCE(SUM(dd.cantidad), 0) FROM devolucion_detalle dd WHERE dd.devolucion_id = dv.id),
                 dv.total
@@ -455,20 +465,21 @@ fn devoluciones(conn: &Connection, desde: &str, hasta: &str) -> rusqlite::Result
          WHERE date(dv.fecha) BETWEEN ?1 AND ?2
          ORDER BY dv.fecha DESC, dv.id DESC
          LIMIT ?3",
-    )?;
-    let filas = stmt.query_map(params![desde, hasta, MAX_FILAS_DEVOLUCIONES], |row| {
-        Ok(ReporteDevolucion {
-            id: row.get(0)?,
-            venta_id: row.get(1)?,
-            fecha: row.get(2)?,
-            motivo: row.get(3)?,
-            reembolso: row.get(4)?,
-            cliente_nombre: row.get(5)?,
-            unidades: row.get(6)?,
-            total: monto(row.get(7)?),
-        })
-    })?;
-    filas.collect()
+        params![desde, hasta, MAX_FILAS_DEVOLUCIONES],
+        |row| {
+            Ok(ReporteDevolucion {
+                id: row.col(0)?,
+                venta_id: row.col(1)?,
+                fecha: row.col(2)?,
+                motivo: row.col(3)?,
+                reembolso: row.col(4)?,
+                cliente_nombre: row.col(5)?,
+                unidades: row.col(6)?,
+                total: monto(row.col(7)?),
+            })
+        },
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -645,8 +656,10 @@ pub async fn exportar_excel(
 mod tests {
     use super::*;
 
-    fn base_de_prueba() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
+    // Devuelve también la Database: libsql la necesita viva mientras se use la conexión.
+    async fn base_de_prueba() -> (libsql::Database, Connection) {
+        let db = libsql::Builder::new_local(":memory:").build().await.unwrap();
+        let conn = db.connect().unwrap();
         conn.execute_batch(
             "CREATE TABLE productos (id INTEGER PRIMARY KEY, categoria TEXT);
              CREATE TABLE ventas (id INTEGER PRIMARY KEY, fecha TEXT, subtotal_cero REAL, subtotal_iva5 REAL,
@@ -669,14 +682,15 @@ mod tests {
              INSERT INTO devoluciones VALUES (1, 1, '2026-11-03 09:00:00', 'DEFECTO', 'EFECTIVO', 0, 0, 10, 0, 1.5, 11.5);
              INSERT INTO devolucion_detalle VALUES (1, 1, 1, 'F1', 'FILTRO', 1, 10);",
         )
+        .await
         .unwrap();
-        conn
+        (db, conn)
     }
 
-    #[test]
-    fn devoluciones_cuentan_en_su_fecha() {
-        let conn = base_de_prueba();
-        let r = construir_reporte(&conn, "2026-11-01", "2026-11-30").unwrap();
+    #[tokio::test]
+    async fn devoluciones_cuentan_en_su_fecha() {
+        let (_db, conn) = base_de_prueba().await;
+        let r = construir_reporte(&conn, "2026-11-01", "2026-11-30").await.unwrap();
         assert_eq!(r.resumen.ventas, 1);
         assert_eq!(r.resumen.ventas_brutas, 11.5);
         assert_eq!(r.resumen.monto_devuelto, 11.5);
@@ -695,23 +709,31 @@ mod tests {
         assert_eq!(r.anterior.ventas_brutas, 23.0);
     }
 
-    #[test]
-    fn rangos_largos_se_agrupan_por_mes() {
-        let conn = base_de_prueba();
-        let r = construir_reporte(&conn, "2026-01-01", "2026-12-31").unwrap();
+    #[tokio::test]
+    async fn rangos_largos_se_agrupan_por_mes() {
+        let (_db, conn) = base_de_prueba().await;
+        let r = construir_reporte(&conn, "2026-01-01", "2026-12-31").await.unwrap();
         assert_eq!(r.agrupacion, "mes");
         assert_eq!(r.serie.len(), 12);
         let nov = r.serie.iter().find(|p| p.periodo == "2026-11").unwrap();
         assert_eq!((nov.ventas, nov.ventas_brutas, nov.devoluciones), (1, 11.5, 11.5));
     }
 
-    #[test]
-    fn rechaza_fechas_invalidas() {
-        let conn = base_de_prueba();
-        assert!(validar_rango(&conn, "2026-11-30", "2026-11-01").is_err());
-        assert!(validar_rango(&conn, "2026-13-01", "2026-12-01").is_err());
-        assert!(validar_rango(&conn, "hoy", "2026-12-01").is_err());
-        assert!(validar_rango(&conn, "2026-11-01", "2026-11-01").is_ok());
+    #[tokio::test]
+    async fn rechaza_fechas_invalidas() {
+        let (_db, conn) = base_de_prueba().await;
+        assert!(validar_rango(&conn, "2026-11-30", "2026-11-01").await.is_err());
+        assert!(validar_rango(&conn, "2026-13-01", "2026-12-01").await.is_err());
+        assert!(validar_rango(&conn, "hoy", "2026-12-01").await.is_err());
+        assert!(validar_rango(&conn, "2026-11-01", "2026-11-01").await.is_ok());
+    }
+
+    // Sin ventas, las sumas vienen como el entero 0: antes de db::col esto hacía caer la app con libsql.
+    #[tokio::test]
+    async fn reporte_de_un_periodo_vacio() {
+        let (_db, conn) = base_de_prueba().await;
+        let r = construir_reporte(&conn, "2020-01-01", "2020-01-31").await.unwrap();
+        assert_eq!((r.resumen.ventas, r.resumen.ventas_brutas, r.impuestos_neto.total), (0, 0.0, 0.0));
     }
 }
 

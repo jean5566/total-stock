@@ -1,12 +1,13 @@
+mod db;
 mod reportes;
 
 use std::path::PathBuf;
-use std::sync::Mutex;
 
-use rusqlite::types::Value;
-use rusqlite::{params, Connection, OptionalExtension, ToSql};
+use db::{con_nombre, es_duplicado, fila, filas, una_fila, FilaExt};
+use libsql::{params, Connection, Row, Value};
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
+use tokio::sync::Mutex;
 
 const PRODUCTOS_POR_PAGINA: i64 = 20;
 const VENTAS_POR_PAGINA: i64 = 20;
@@ -64,13 +65,29 @@ struct InfoBaseDatos {
     total_productos: i64,
 }
 
-// La conexión es None hasta que el usuario crea la base de datos en el primer inicio.
-struct AppState {
-    db: Mutex<Option<Connection>>,
+// Base de datos abierta: libsql necesita conservar `Database` mientras se use la conexión.
+// La ruta se guarda aparte porque libsql no la expone (se usa para copias y para borrar el archivo).
+struct BaseActiva {
+    _db: libsql::Database,
+    conn: Connection,
+    ruta: PathBuf,
 }
 
-fn abrir_base_de_datos(ruta: PathBuf) -> rusqlite::Result<Connection> {
-    let conn = Connection::open(ruta)?;
+// La base es None hasta que el usuario crea la base de datos en el primer inicio.
+// Es un Mutex de tokio porque se mantiene tomado durante las consultas (que son async): así los
+// comandos se ejecutan de a uno, como antes, y una transacción no se mezcla con otro comando.
+struct AppState {
+    db: Mutex<Option<BaseActiva>>,
+}
+
+async fn abrir_base_de_datos(ruta: PathBuf) -> libsql::Result<BaseActiva> {
+    let db = libsql::Builder::new_local(&ruta).build().await?;
+    let conn = db.connect()?;
+    crear_esquema(&conn).await?;
+    Ok(BaseActiva { _db: db, conn, ruta })
+}
+
+async fn crear_esquema(conn: &Connection) -> libsql::Result<()> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS productos (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,24 +98,25 @@ fn abrir_base_de_datos(ruta: PathBuf) -> rusqlite::Result<Connection> {
             iva TEXT NOT NULL,
             stock INTEGER NOT NULL
         )",
-        [],
-    )?;
+        (),
+    )
+    .await?;
 
     // Evita códigos/SKU duplicados. Si la base ya tenía duplicados de antes (p. ej. por el bug de
     // guardado corregido previamente), la creación del índice falla y simplemente no se aplica la
     // restricción; no queremos impedir que la app arranque por datos de prueba viejos.
-    let _ = conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_productos_codigo ON productos (codigo)",
-        [],
-    );
+    let _ = conn
+        .execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_productos_codigo ON productos (codigo)", ())
+        .await;
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS categorias (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             nombre TEXT NOT NULL UNIQUE
         )",
-        [],
-    )?;
+        (),
+    )
+    .await?;
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS movimientos_stock (
@@ -110,8 +128,9 @@ fn abrir_base_de_datos(ruta: PathBuf) -> rusqlite::Result<Connection> {
             fecha TEXT NOT NULL,
             FOREIGN KEY (producto_id) REFERENCES productos (id)
         )",
-        [],
-    )?;
+        (),
+    )
+    .await?;
 
     // Cabecera de cada venta. Los importes se calculan en centavos y se guardan ya redondeados a
     // 2 decimales.
@@ -128,8 +147,9 @@ fn abrir_base_de_datos(ruta: PathBuf) -> rusqlite::Result<Connection> {
             pago REAL NOT NULL,
             cambio REAL NOT NULL
         )",
-        [],
-    )?;
+        (),
+    )
+    .await?;
 
     // Líneas de cada venta. Se guarda una copia de código/detalle/precio/IVA del momento de la venta,
     // para que el historial no cambie si luego se edita o elimina el producto del catálogo.
@@ -145,12 +165,14 @@ fn abrir_base_de_datos(ruta: PathBuf) -> rusqlite::Result<Connection> {
             iva TEXT NOT NULL,
             subtotal REAL NOT NULL
         )",
-        [],
-    )?;
+        (),
+    )
+    .await?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_venta_detalle_venta ON venta_detalle (venta_id)",
-        [],
-    )?;
+        (),
+    )
+    .await?;
 
     // Ajustes de la app como pares clave/valor (p. ej. usar_medida = "1").
     conn.execute(
@@ -158,17 +180,18 @@ fn abrir_base_de_datos(ruta: PathBuf) -> rusqlite::Result<Connection> {
             clave TEXT PRIMARY KEY,
             valor TEXT NOT NULL
         )",
-        [],
-    )?;
+        (),
+    )
+    .await?;
 
     // Columnas agregadas después de la primera versión: se crean si la base es anterior.
-    asegurar_columna(&conn, "productos", "medida", "TEXT NOT NULL DEFAULT ''")?;
-    asegurar_columna(&conn, "venta_detalle", "medida", "TEXT NOT NULL DEFAULT ''")?;
-    asegurar_columna(&conn, "productos", "aplicacion", "TEXT NOT NULL DEFAULT ''")?;
-    asegurar_columna(&conn, "ventas", "descuento", "REAL NOT NULL DEFAULT 0")?;
-    asegurar_columna(&conn, "venta_detalle", "precio_lista", "REAL NOT NULL DEFAULT 0")?;
-    asegurar_columna(&conn, "venta_detalle", "descuento_pct", "REAL NOT NULL DEFAULT 0")?;
-    asegurar_columna(&conn, "venta_detalle", "descuento", "REAL NOT NULL DEFAULT 0")?;
+    asegurar_columna(conn, "productos", "medida", "TEXT NOT NULL DEFAULT ''").await?;
+    asegurar_columna(conn, "venta_detalle", "medida", "TEXT NOT NULL DEFAULT ''").await?;
+    asegurar_columna(conn, "productos", "aplicacion", "TEXT NOT NULL DEFAULT ''").await?;
+    asegurar_columna(conn, "ventas", "descuento", "REAL NOT NULL DEFAULT 0").await?;
+    asegurar_columna(conn, "venta_detalle", "precio_lista", "REAL NOT NULL DEFAULT 0").await?;
+    asegurar_columna(conn, "venta_detalle", "descuento_pct", "REAL NOT NULL DEFAULT 0").await?;
+    asegurar_columna(conn, "venta_detalle", "descuento", "REAL NOT NULL DEFAULT 0").await?;
 
     // Clientes. La venta guarda el id y una copia del nombre (para que el historial no cambie si se
     // edita o elimina el cliente). Sin cliente = consumidor final.
@@ -183,12 +206,13 @@ fn abrir_base_de_datos(ruta: PathBuf) -> rusqlite::Result<Connection> {
             direccion TEXT NOT NULL DEFAULT '',
             fecha_registro TEXT NOT NULL
         )",
-        [],
-    )?;
-    asegurar_columna(&conn, "ventas", "cliente_id", "INTEGER")?;
-    asegurar_columna(&conn, "ventas", "cliente_nombre", "TEXT NOT NULL DEFAULT ''")?;
-    asegurar_columna(&conn, "ventas", "cliente_identificacion", "TEXT NOT NULL DEFAULT ''")?;
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_ventas_cliente ON ventas (cliente_id)", [])?;
+        (),
+    )
+    .await?;
+    asegurar_columna(conn, "ventas", "cliente_id", "INTEGER").await?;
+    asegurar_columna(conn, "ventas", "cliente_nombre", "TEXT NOT NULL DEFAULT ''").await?;
+    asegurar_columna(conn, "ventas", "cliente_identificacion", "TEXT NOT NULL DEFAULT ''").await?;
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ventas_cliente ON ventas (cliente_id)", ()).await?;
 
     // Devoluciones. Nunca se modifica ni se borra la venta original: cada devolución es un documento
     // aparte ligado a la venta, con copia de los importes devueltos. `reembolso` indica cómo se
@@ -208,9 +232,10 @@ fn abrir_base_de_datos(ruta: PathBuf) -> rusqlite::Result<Connection> {
             iva15 REAL NOT NULL,
             total REAL NOT NULL
         )",
-        [],
-    )?;
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_devoluciones_venta ON devoluciones (venta_id)", [])?;
+        (),
+    )
+    .await?;
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_devoluciones_venta ON devoluciones (venta_id)", ()).await?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS devolucion_detalle (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -225,47 +250,49 @@ fn abrir_base_de_datos(ruta: PathBuf) -> rusqlite::Result<Connection> {
             subtotal REAL NOT NULL,
             regresa_stock INTEGER NOT NULL
         )",
-        [],
-    )?;
+        (),
+    )
+    .await?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_devolucion_detalle_dev ON devolucion_detalle (devolucion_id)",
-        [],
-    )?;
+        (),
+    )
+    .await?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_devolucion_detalle_linea ON devolucion_detalle (venta_detalle_id)",
-        [],
-    )?;
+        (),
+    )
+    .await?;
     // Venta hecha como cambio: devolución cuyo crédito se aplicó y monto de ese crédito.
-    asegurar_columna(&conn, "ventas", "devolucion_id", "INTEGER")?;
-    asegurar_columna(&conn, "ventas", "credito", "REAL NOT NULL DEFAULT 0")?;
+    asegurar_columna(conn, "ventas", "devolucion_id", "INTEGER").await?;
+    asegurar_columna(conn, "ventas", "credito", "REAL NOT NULL DEFAULT 0").await?;
     // Un crédito por devolución solo se puede usar en una venta.
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_ventas_devolucion ON ventas (devolucion_id)
          WHERE devolucion_id IS NOT NULL",
-        [],
-    )?;
+        (),
+    )
+    .await?;
 
-    Ok(conn)
+    Ok(())
 }
 
 // Agrega una columna a una tabla existente solo si todavía no existe (migración simple).
 // `tabla`, `columna` y `definicion` son siempre literales de este archivo, nunca datos del usuario.
-fn asegurar_columna(
+async fn asegurar_columna(
     conn: &Connection,
     tabla: &str,
     columna: &str,
     definicion: &str,
-) -> rusqlite::Result<()> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", tabla))?;
-    let existe = stmt
-        .query_map([], |row| row.get::<_, String>(1))?
-        .filter_map(Result::ok)
-        .any(|nombre| nombre == columna);
-    if !existe {
+) -> libsql::Result<()> {
+    let columnas: Vec<String> =
+        filas(conn, &format!("PRAGMA table_info({})", tabla), (), |row| row.col(1)).await?;
+    if !columnas.iter().any(|nombre| nombre == columna) {
         conn.execute(
             &format!("ALTER TABLE {} ADD COLUMN {} {}", tabla, columna, definicion),
-            [],
-        )?;
+            (),
+        )
+        .await?;
     }
     Ok(())
 }
@@ -326,17 +353,17 @@ mod pruebas_nombre_archivo {
     }
 }
 
-fn info_de_conexion(conn: &Connection) -> rusqlite::Result<InfoBaseDatos> {
-    let ruta = conn.path().map(|p| p.to_string()).unwrap_or_default();
-    let nombre = std::path::Path::new(&ruta)
+async fn info_de_conexion(base: &BaseActiva) -> libsql::Result<InfoBaseDatos> {
+    let nombre = base
+        .ruta
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "catalogo".to_string());
-    let total_productos = contar_productos(conn, &None, &None, &None)?;
+    let total_productos = contar_productos(&base.conn, &None, &None, &None).await?;
 
     Ok(InfoBaseDatos {
         nombre,
-        ruta,
+        ruta: base.ruta.to_string_lossy().to_string(),
         total_productos,
     })
 }
@@ -368,33 +395,26 @@ fn limpiar_opcional(valor: Option<String>) -> Option<String> {
 // Claves de ajustes de tipo encendido/apagado que se pueden guardar desde Configuración.
 const AJUSTES_BOOLEANOS: [&str; 2] = ["usar_medida", "usar_aplicacion"];
 
-fn leer_ajuste_booleano(conn: &Connection, clave: &str) -> rusqlite::Result<bool> {
-    let valor: Option<String> = conn
-        .query_row(
-            "SELECT valor FROM configuracion WHERE clave = ?1",
-            params![clave],
-            |row| row.get(0),
-        )
-        .optional()?;
-    Ok(valor.as_deref() == Some("1"))
+async fn leer_ajuste_booleano(conn: &Connection, clave: &str) -> libsql::Result<bool> {
+    Ok(leer_ajuste_texto(conn, clave).await? == "1")
 }
 
-fn leer_ajustes(conn: &Connection) -> rusqlite::Result<Ajustes> {
+async fn leer_ajustes(conn: &Connection) -> libsql::Result<Ajustes> {
     Ok(Ajustes {
-        usar_medida: leer_ajuste_booleano(conn, "usar_medida")?,
-        usar_aplicacion: leer_ajuste_booleano(conn, "usar_aplicacion")?,
+        usar_medida: leer_ajuste_booleano(conn, "usar_medida").await?,
+        usar_aplicacion: leer_ajuste_booleano(conn, "usar_aplicacion").await?,
     })
 }
 
 #[tauri::command]
-fn obtener_ajustes(state: tauri::State<'_, AppState>) -> Result<Ajustes, String> {
-    let conn_guard = state.db.lock().unwrap();
-    let conn = requerir_conexion(&conn_guard)?;
-    leer_ajustes(conn).map_err(|e| e.to_string())
+async fn obtener_ajustes(state: tauri::State<'_, AppState>) -> Result<Ajustes, String> {
+    let guard = state.db.lock().await;
+    let conn = requerir_conexion(&guard)?;
+    leer_ajustes(conn).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn guardar_ajuste(
+async fn guardar_ajuste(
     state: tauri::State<'_, AppState>,
     clave: String,
     activo: bool,
@@ -402,15 +422,16 @@ fn guardar_ajuste(
     if !AJUSTES_BOOLEANOS.contains(&clave.as_str()) {
         return Err("Ajuste no válido.".to_string());
     }
-    let conn_guard = state.db.lock().unwrap();
-    let conn = requerir_conexion(&conn_guard)?;
+    let guard = state.db.lock().await;
+    let conn = requerir_conexion(&guard)?;
     conn.execute(
         "INSERT INTO configuracion (clave, valor) VALUES (?1, ?2)
          ON CONFLICT(clave) DO UPDATE SET valor = excluded.valor",
         params![clave, if activo { "1" } else { "0" }],
     )
+    .await
     .map_err(|e| e.to_string())?;
-    leer_ajustes(conn).map_err(|e| e.to_string())
+    leer_ajustes(conn).await.map_err(|e| e.to_string())
 }
 
 // Datos del negocio (para encabezados de comprobantes, reportes, etc.). Se guardan en la tabla
@@ -427,14 +448,10 @@ struct DatosNegocio {
     email: String,
 }
 
-fn leer_ajuste_texto(conn: &Connection, clave: &str) -> rusqlite::Result<String> {
-    let valor: Option<String> = conn
-        .query_row(
-            "SELECT valor FROM configuracion WHERE clave = ?1",
-            params![clave],
-            |row| row.get(0),
-        )
-        .optional()?;
+async fn leer_ajuste_texto(conn: &Connection, clave: &str) -> libsql::Result<String> {
+    let valor: Option<String> =
+        una_fila(conn, "SELECT valor FROM configuracion WHERE clave = ?1", params![clave], |row| row.col(0))
+            .await?;
     Ok(valor.unwrap_or_default())
 }
 
@@ -444,48 +461,49 @@ const CLAVE_VENTAS_ABIERTAS: &str = "ventas_abiertas";
 const MAX_BYTES_VENTAS_ABIERTAS: usize = 512 * 1024;
 
 #[tauri::command]
-fn obtener_ventas_abiertas(state: tauri::State<'_, AppState>) -> Result<String, String> {
-    let conn_guard = state.db.lock().unwrap();
-    let conn = requerir_conexion(&conn_guard)?;
-    leer_ajuste_texto(conn, CLAVE_VENTAS_ABIERTAS).map_err(|e| e.to_string())
+async fn obtener_ventas_abiertas(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let guard = state.db.lock().await;
+    let conn = requerir_conexion(&guard)?;
+    leer_ajuste_texto(conn, CLAVE_VENTAS_ABIERTAS).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn guardar_ventas_abiertas(state: tauri::State<'_, AppState>, datos: String) -> Result<(), String> {
+async fn guardar_ventas_abiertas(state: tauri::State<'_, AppState>, datos: String) -> Result<(), String> {
     if datos.len() > MAX_BYTES_VENTAS_ABIERTAS {
         return Err("Hay demasiadas ventas abiertas para guardarlas.".to_string());
     }
-    let conn_guard = state.db.lock().unwrap();
-    let conn = requerir_conexion(&conn_guard)?;
+    let guard = state.db.lock().await;
+    let conn = requerir_conexion(&guard)?;
     conn.execute(
         "INSERT INTO configuracion (clave, valor) VALUES (?1, ?2)
          ON CONFLICT(clave) DO UPDATE SET valor = excluded.valor",
         params![CLAVE_VENTAS_ABIERTAS, datos],
     )
+    .await
     .map_err(|e| e.to_string())?;
     Ok(())
 }
 
-fn leer_datos_negocio(conn: &Connection) -> rusqlite::Result<DatosNegocio> {
+async fn leer_datos_negocio(conn: &Connection) -> libsql::Result<DatosNegocio> {
     Ok(DatosNegocio {
-        nombre_comercial: leer_ajuste_texto(conn, "negocio_nombre_comercial")?,
-        razon_social: leer_ajuste_texto(conn, "negocio_razon_social")?,
-        ruc: leer_ajuste_texto(conn, "negocio_ruc")?,
-        direccion: leer_ajuste_texto(conn, "negocio_direccion")?,
-        telefono: leer_ajuste_texto(conn, "negocio_telefono")?,
-        email: leer_ajuste_texto(conn, "negocio_email")?,
+        nombre_comercial: leer_ajuste_texto(conn, "negocio_nombre_comercial").await?,
+        razon_social: leer_ajuste_texto(conn, "negocio_razon_social").await?,
+        ruc: leer_ajuste_texto(conn, "negocio_ruc").await?,
+        direccion: leer_ajuste_texto(conn, "negocio_direccion").await?,
+        telefono: leer_ajuste_texto(conn, "negocio_telefono").await?,
+        email: leer_ajuste_texto(conn, "negocio_email").await?,
     })
 }
 
 #[tauri::command]
-fn obtener_datos_negocio(state: tauri::State<'_, AppState>) -> Result<DatosNegocio, String> {
-    let conn_guard = state.db.lock().unwrap();
-    let conn = requerir_conexion(&conn_guard)?;
-    leer_datos_negocio(conn).map_err(|e| e.to_string())
+async fn obtener_datos_negocio(state: tauri::State<'_, AppState>) -> Result<DatosNegocio, String> {
+    let guard = state.db.lock().await;
+    let conn = requerir_conexion(&guard)?;
+    leer_datos_negocio(conn).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn guardar_datos_negocio(
+async fn guardar_datos_negocio(
     state: tauri::State<'_, AppState>,
     datos: DatosNegocio,
 ) -> Result<DatosNegocio, String> {
@@ -508,9 +526,9 @@ fn guardar_datos_negocio(
         return Err("El email no es válido.".to_string());
     }
 
-    let conn_guard = state.db.lock().unwrap();
-    let conn = requerir_conexion(&conn_guard)?;
-    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let guard = state.db.lock().await;
+    let conn = requerir_conexion(&guard)?;
+    let tx = conn.transaction().await.map_err(|e| e.to_string())?;
     for (clave, valor) in [
         ("negocio_nombre_comercial", &datos.nombre_comercial),
         ("negocio_razon_social", &datos.razon_social),
@@ -522,13 +540,14 @@ fn guardar_datos_negocio(
         tx.execute(
             "INSERT INTO configuracion (clave, valor) VALUES (?1, ?2)
              ON CONFLICT(clave) DO UPDATE SET valor = excluded.valor",
-            params![clave, valor],
+            params![clave, valor.as_str()],
         )
+        .await
         .map_err(|e| e.to_string())?;
     }
-    tx.commit().map_err(|e| e.to_string())?;
+    tx.commit().await.map_err(|e| e.to_string())?;
 
-    leer_datos_negocio(conn).map_err(|e| e.to_string())
+    leer_datos_negocio(conn).await.map_err(|e| e.to_string())
 }
 
 // El precio se maneja siempre con 2 decimales (centavos).
@@ -536,13 +555,8 @@ fn redondear_precio(precio: f64) -> f64 {
     (precio * 100.0).round() / 100.0
 }
 
-// true si el error es por violar una restricción UNIQUE (p. ej. código o nombre duplicado).
-fn es_duplicado(err: &rusqlite::Error) -> bool {
-    matches!(err, rusqlite::Error::SqliteFailure(_, Some(mensaje)) if mensaje.contains("UNIQUE"))
-}
-
 // Traduce errores de SQLite a mensajes entendibles por el usuario (p. ej. código duplicado).
-fn mapear_error_guardado(err: rusqlite::Error) -> String {
+fn mapear_error_guardado(err: libsql::Error) -> String {
     if es_duplicado(&err) {
         return "Ya existe un producto con ese código.".to_string();
     }
@@ -607,28 +621,20 @@ fn condicion_palabras(texto: &str, expr: &str) -> Option<(String, Vec<(&'static 
     Some((format!("({})", condiciones.join(" AND ")), valores))
 }
 
-fn como_parametros<'a>(valores: &'a [(&'static str, Value)]) -> Vec<(&'static str, &'a dyn ToSql)> {
-    valores.iter().map(|(k, v)| (*k, v as &dyn ToSql)).collect()
-}
-
 #[cfg(test)]
 mod pruebas_busqueda {
     use super::*;
 
-    fn buscar(conn: &Connection, texto: &str) -> Vec<String> {
+    async fn buscar(conn: &Connection, texto: &str) -> Vec<String> {
         let (clausula, valores) = construir_filtro(&Some(texto.to_string()), &None, &None);
-        let mut stmt = conn
-            .prepare(&format!("SELECT detalle FROM productos {} ORDER BY id", clausula))
-            .unwrap();
-        stmt.query_map(&como_parametros(&valores)[..], |row| row.get(0))
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<String>>>()
-            .unwrap()
+        let sql = format!("SELECT detalle FROM productos {} ORDER BY id", clausula);
+        filas(conn, &sql, con_nombre(&valores), |row| row.col(0)).await.unwrap()
     }
 
-    #[test]
-    fn busca_palabras_en_cualquier_orden_y_sin_tildes() {
-        let conn = Connection::open_in_memory().unwrap();
+    #[tokio::test]
+    async fn busca_palabras_en_cualquier_orden_y_sin_tildes() {
+        let db = libsql::Builder::new_local(":memory:").build().await.unwrap();
+        let conn = db.connect().unwrap();
         conn.execute_batch(
             "CREATE TABLE productos (id INTEGER PRIMARY KEY, codigo TEXT, detalle TEXT, categoria TEXT,
                                      medida TEXT, aplicacion TEXT, stock INTEGER);
@@ -638,16 +644,20 @@ mod pruebas_busqueda {
                (3, 'R-300', 'RODAMIENTO TRASERO', 'RODAMIENTOS', '6204', 'HYUNDAI ACCENT', 5),
                (4, 'X_1', 'PRODUCTO 100%', 'VARIOS', '', '', 5);",
         )
+        .await
         .unwrap();
 
-        assert_eq!(buscar(&conn, "aveo rodam"), vec!["RODAMIENTO RUEDA DELANTERA"]);
-        assert_eq!(buscar(&conn, "valvula admision"), vec!["VÁLVULA DE ADMISIÓN"]);
-        assert_eq!(buscar(&conn, "  rodamiento  "), vec!["RODAMIENTO RUEDA DELANTERA", "RODAMIENTO TRASERO"]);
-        assert_eq!(buscar(&conn, "6203 delantera"), vec!["RODAMIENTO RUEDA DELANTERA"]);
-        assert!(buscar(&conn, "rodamiento suzuki").is_empty());
+        assert_eq!(buscar(&conn, "aveo rodam").await, vec!["RODAMIENTO RUEDA DELANTERA"]);
+        assert_eq!(buscar(&conn, "valvula admision").await, vec!["VÁLVULA DE ADMISIÓN"]);
+        assert_eq!(
+            buscar(&conn, "  rodamiento  ").await,
+            vec!["RODAMIENTO RUEDA DELANTERA", "RODAMIENTO TRASERO"]
+        );
+        assert_eq!(buscar(&conn, "6203 delantera").await, vec!["RODAMIENTO RUEDA DELANTERA"]);
+        assert!(buscar(&conn, "rodamiento suzuki").await.is_empty());
         // Los comodines de LIKE se buscan literalmente
-        assert_eq!(buscar(&conn, "100%"), vec!["PRODUCTO 100%"]);
-        assert_eq!(buscar(&conn, "x_"), vec!["PRODUCTO 100%"]);
+        assert_eq!(buscar(&conn, "100%").await, vec!["PRODUCTO 100%"]);
+        assert_eq!(buscar(&conn, "x_").await, vec!["PRODUCTO 100%"]);
     }
 }
 
@@ -695,31 +705,31 @@ fn construir_filtro(
     (clausula, valores)
 }
 
-fn contar_productos(
+async fn contar_productos(
     conn: &Connection,
     busqueda: &Option<String>,
     categoria: &Option<String>,
     estado_stock: &Option<String>,
-) -> rusqlite::Result<i64> {
+) -> libsql::Result<i64> {
     let (clausula, valores) = construir_filtro(busqueda, categoria, estado_stock);
     let sql = format!("SELECT COUNT(*) FROM productos {}", clausula);
-    conn.query_row(&sql, &como_parametros(&valores)[..], |row| row.get(0))
+    fila(conn, &sql, con_nombre(&valores), |row| row.col(0)).await
 }
 
 // Columnas de un producto en el orden que espera mapear_producto.
 const COLUMNAS_PRODUCTO: &str = "id, codigo, detalle, categoria, precio, iva, stock, medida, aplicacion";
 
-fn mapear_producto(row: &rusqlite::Row) -> rusqlite::Result<Producto> {
+fn mapear_producto(row: &Row) -> libsql::Result<Producto> {
     Ok(Producto {
-        id: row.get(0)?,
-        codigo: row.get(1)?,
-        detalle: row.get(2)?,
-        categoria: row.get(3)?,
-        precio: row.get(4)?,
-        iva: row.get(5)?,
-        stock: row.get(6)?,
-        medida: row.get(7)?,
-        aplicacion: row.get(8)?,
+        id: row.col(0)?,
+        codigo: row.col(1)?,
+        detalle: row.col(2)?,
+        categoria: row.col(3)?,
+        precio: row.col(4)?,
+        iva: row.col(5)?,
+        stock: row.col(6)?,
+        medida: row.col(7)?,
+        aplicacion: row.col(8)?,
     })
 }
 
@@ -727,15 +737,15 @@ fn mapear_producto(row: &rusqlite::Row) -> rusqlite::Result<Producto> {
 // que cumplen los filtros, para no tener que cargar la tabla completa en el frontend.
 // `orden_por` es siempre un literal fijo definido en este archivo (no viene del usuario), así que es
 // seguro interpolarlo directamente en el SQL.
-fn listar_pagina(
+async fn listar_pagina(
     conn: &Connection,
     pagina_solicitada: i64,
     busqueda: &Option<String>,
     categoria: &Option<String>,
     estado_stock: &Option<String>,
     orden_por: &str,
-) -> rusqlite::Result<PaginaProductos> {
-    let total = contar_productos(conn, busqueda, categoria, estado_stock)?;
+) -> libsql::Result<PaginaProductos> {
+    let total = contar_productos(conn, busqueda, categoria, estado_stock).await?;
     let total_paginas = ((total as f64) / (PRODUCTOS_POR_PAGINA as f64)).ceil().max(1.0) as i64;
     let pagina = pagina_solicitada.clamp(1, total_paginas);
     let offset = (pagina - 1) * PRODUCTOS_POR_PAGINA;
@@ -749,10 +759,7 @@ fn listar_pagina(
         COLUMNAS_PRODUCTO, clausula, orden_por
     );
 
-    let mut stmt = conn.prepare(&sql)?;
-    let productos = stmt
-        .query_map(&como_parametros(&valores)[..], mapear_producto)?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let productos = filas(conn, &sql, con_nombre(&valores), mapear_producto).await?;
 
     Ok(PaginaProductos {
         productos,
@@ -762,22 +769,20 @@ fn listar_pagina(
 }
 
 // Las operaciones sobre productos requieren que ya exista una base de datos configurada.
-fn requerir_conexion(
-    conn_opt: &Option<Connection>,
-) -> Result<&Connection, String> {
-    conn_opt
-        .as_ref()
+fn requerir_conexion(base: &Option<BaseActiva>) -> Result<&Connection, String> {
+    base.as_ref()
+        .map(|b| &b.conn)
         .ok_or_else(|| "La base de datos no está configurada.".to_string())
 }
 
 #[tauri::command]
-fn obtener_configuracion_db(
+async fn obtener_configuracion_db(
     state: tauri::State<'_, AppState>,
 ) -> Result<Option<InfoBaseDatos>, String> {
-    let conn_guard = state.db.lock().unwrap();
-    match conn_guard.as_ref() {
+    let guard = state.db.lock().await;
+    match guard.as_ref() {
         None => Ok(None),
-        Some(conn) => info_de_conexion(conn).map(Some).map_err(|e| e.to_string()),
+        Some(base) => info_de_conexion(base).await.map(Some).map_err(|e| e.to_string()),
     }
 }
 
@@ -789,41 +794,42 @@ const PALABRA_CONFIRMACION: &str = "CONFIRMAR";
 // Cierra la conexión, elimina el archivo .db y sus archivos auxiliares de SQLite, y deja la app
 // sin base configurada para que se cree una nueva desde la pantalla de primer inicio.
 #[tauri::command]
-fn eliminar_base_de_datos(state: tauri::State<'_, AppState>, confirmacion: String) -> Result<(), String> {
+async fn eliminar_base_de_datos(state: tauri::State<'_, AppState>, confirmacion: String) -> Result<(), String> {
     if confirmacion.trim() != PALABRA_CONFIRMACION {
         return Err(format!("Escribe {} para eliminar la base de datos.", PALABRA_CONFIRMACION));
     }
 
-    let mut conn_guard = state.db.lock().unwrap();
-    let conn = conn_guard
+    let mut guard = state.db.lock().await;
+    let base = guard
         .take()
         .ok_or_else(|| "La base de datos no está configurada.".to_string())?;
-    let ruta = conn.path().map(|p| p.to_string()).unwrap_or_default();
+    let ruta = base.ruta.clone();
 
-    // En Windows el archivo no se puede borrar mientras la conexión esté abierta.
-    if let Err((conn, e)) = conn.close() {
-        *conn_guard = Some(conn);
-        return Err(format!("No se pudo cerrar la base de datos: {}", e));
-    }
+    // En Windows el archivo no se puede borrar mientras la conexión esté abierta: al soltar
+    // `base` se cierran la conexión y la base.
+    drop(base);
 
-    if ruta.is_empty() {
-        return Err("No se encontró el archivo de la base de datos.".to_string());
+    if let Err(e) = std::fs::remove_file(&ruta) {
+        // Si no se pudo borrar, se vuelve a abrir para que la app no quede sin base.
+        if let Ok(base) = abrir_base_de_datos(ruta.clone()).await {
+            *guard = Some(base);
+        }
+        return Err(format!("No se pudo eliminar el archivo: {}", e));
     }
-    std::fs::remove_file(&ruta).map_err(|e| format!("No se pudo eliminar el archivo: {}", e))?;
     for sufijo in ["-wal", "-shm", "-journal"] {
-        let _ = std::fs::remove_file(format!("{}{}", ruta, sufijo));
+        let _ = std::fs::remove_file(format!("{}{}", ruta.display(), sufijo));
     }
     Ok(())
 }
 
 #[tauri::command]
-fn crear_base_de_datos(
+async fn crear_base_de_datos(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     nombre: String,
 ) -> Result<InfoBaseDatos, String> {
-    let mut conn_guard = state.db.lock().unwrap();
-    if conn_guard.is_some() {
+    let mut guard = state.db.lock().await;
+    if guard.is_some() {
         return Err("Ya existe una base de datos configurada.".to_string());
     }
 
@@ -839,9 +845,9 @@ fn crear_base_de_datos(
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 
     let ruta = dir.join(format!("{}.db", nombre_limpio));
-    let conn = abrir_base_de_datos(ruta).map_err(|e| e.to_string())?;
-    let info = info_de_conexion(&conn).map_err(|e| e.to_string());
-    *conn_guard = Some(conn);
+    let base = abrir_base_de_datos(ruta).await.map_err(|e| e.to_string())?;
+    let info = info_de_conexion(&base).await.map_err(|e| e.to_string());
+    *guard = Some(base);
     info
 }
 
@@ -877,9 +883,9 @@ fn directorio_copias(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 
 // Crea una copia consistente de la base con VACUUM INTO (funciona con la conexión abierta).
 // El nombre empieza con la fecha para que se ordenen solas: "2026-11-07_15-30-00_manual.db".
-fn crear_copia(conn: &Connection, dir: &std::path::Path, tipo: &str) -> Result<PathBuf, String> {
-    let fecha: String = conn
-        .query_row("SELECT strftime('%Y-%m-%d_%H-%M-%S', 'now', 'localtime')", [], |row| row.get(0))
+async fn crear_copia(conn: &Connection, dir: &std::path::Path, tipo: &str) -> Result<PathBuf, String> {
+    let fecha: String = fila(conn, "SELECT strftime('%Y-%m-%d_%H-%M-%S', 'now', 'localtime')", (), |row| row.col(0))
+        .await
         .map_err(|e| e.to_string())?;
     let mut destino = dir.join(format!("{}_{}.db", fecha, tipo));
     // Dos copias en el mismo segundo: se agrega un número (VACUUM INTO exige que el archivo no exista)
@@ -888,9 +894,32 @@ fn crear_copia(conn: &Connection, dir: &std::path::Path, tipo: &str) -> Result<P
         destino = dir.join(format!("{}_{}-{}.db", fecha, tipo, n));
         n += 1;
     }
-    conn.execute("VACUUM INTO ?1", params![destino.to_string_lossy()])
+    conn.execute("VACUUM INTO ?1", params![destino.to_string_lossy().to_string()])
+        .await
         .map_err(|e| format!("No se pudo crear la copia de seguridad: {}", e))?;
     Ok(destino)
+}
+
+// true si el archivo es una base SQLite con la tabla de productos de esta app (se abre solo lectura).
+async fn es_copia_valida(ruta: &std::path::Path) -> bool {
+    let Ok(db) = libsql::Builder::new_local(ruta)
+        .flags(libsql::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .build()
+        .await
+    else {
+        return false;
+    };
+    let Ok(conn) = db.connect() else {
+        return false;
+    };
+    let tablas: libsql::Result<i64> = fila(
+        &conn,
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'productos'",
+        (),
+        |row| row.col(0),
+    )
+    .await;
+    matches!(tablas, Ok(n) if n > 0)
 }
 
 // Solo acepta un nombre de archivo .db que exista dentro de la carpeta de copias (sin rutas),
@@ -939,22 +968,21 @@ fn listar_copias(dir: &std::path::Path) -> Result<Vec<CopiaSeguridad>, String> {
 mod pruebas_copias {
     use super::*;
 
-    #[test]
-    fn crea_y_lista_copias() {
+    #[tokio::test]
+    async fn crea_y_lista_copias() {
         let dir = std::env::temp_dir().join(format!("copias-prueba-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let conn = abrir_base_de_datos(dir.join("base.db")).unwrap();
-        let copia = crear_copia(&conn, &dir, "manual").unwrap();
-        crear_copia(&conn, &dir, "antes-de-restaurar").unwrap();
+        let base = abrir_base_de_datos(dir.join("base.db")).await.unwrap();
+        let copia = crear_copia(&base.conn, &dir, "manual").await.unwrap();
+        crear_copia(&base.conn, &dir, "antes-de-restaurar").await.unwrap();
 
-        // La copia es una base válida con la tabla de productos
-        let prueba = Connection::open(&copia).unwrap();
-        let tablas: i64 = prueba
-            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = 'productos'", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(tablas, 1);
+        // La copia es una base válida con la tabla de productos; un archivo cualquiera no lo es.
+        assert!(es_copia_valida(&copia).await);
+        std::fs::write(dir.join("basura.db"), b"no es sqlite").unwrap();
+        assert!(!es_copia_valida(&dir.join("basura.db")).await);
+        std::fs::remove_file(dir.join("basura.db")).unwrap();
 
         let copias = listar_copias(&dir).unwrap();
         // base.db también está en este directorio de prueba, se excluye por el nombre
@@ -967,8 +995,10 @@ mod pruebas_copias {
         assert!(ruta_copia(&dir, "../otra.db").is_err());
         assert!(ruta_copia(&dir, &copias[0].archivo).is_ok());
 
-        drop(prueba);
-        drop(conn);
+        // Al soltar la base se cierra el archivo (en Windows no se puede borrar si sigue abierto).
+        let ruta_base = base.ruta.clone();
+        drop(base);
+        std::fs::remove_file(&ruta_base).expect("la base cerrada se puede borrar");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -979,14 +1009,14 @@ fn obtener_copias_seguridad(app: tauri::AppHandle) -> Result<Vec<CopiaSeguridad>
 }
 
 #[tauri::command]
-fn crear_copia_seguridad(
+async fn crear_copia_seguridad(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<CopiaSeguridad>, String> {
     let dir = directorio_copias(&app)?;
-    let conn_guard = state.db.lock().unwrap();
-    let conn = requerir_conexion(&conn_guard)?;
-    crear_copia(conn, &dir, "manual")?;
+    let guard = state.db.lock().await;
+    let conn = requerir_conexion(&guard)?;
+    crear_copia(conn, &dir, "manual").await?;
     listar_copias(&dir)
 }
 
@@ -1001,7 +1031,7 @@ fn eliminar_copia_seguridad(app: tauri::AppHandle, archivo: String) -> Result<Ve
 // Reemplaza la base activa por una copia. Antes guarda una copia automática del estado actual,
 // así un restaurado por error se puede deshacer restaurando esa copia.
 #[tauri::command]
-fn restaurar_copia_seguridad(
+async fn restaurar_copia_seguridad(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     archivo: String,
@@ -1010,65 +1040,52 @@ fn restaurar_copia_seguridad(
     let origen = ruta_copia(&dir, &archivo)?;
 
     // Verifica que la copia sea una base válida de esta app antes de tocar nada.
-    {
-        let invalida = || "El archivo no es una copia válida.".to_string();
-        let prueba = Connection::open_with_flags(&origen, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(|_| invalida())?;
-        let tablas: i64 = prueba
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'productos'",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|_| invalida())?;
-        if tablas == 0 {
-            return Err(invalida());
-        }
+    if !es_copia_valida(&origen).await {
+        return Err("El archivo no es una copia válida.".to_string());
     }
 
-    let mut conn_guard = state.db.lock().unwrap();
-    let conn = conn_guard
+    let mut guard = state.db.lock().await;
+    let base = guard
         .take()
         .ok_or_else(|| "La base de datos no está configurada.".to_string())?;
-    let ruta_actual = PathBuf::from(conn.path().map(|p| p.to_string()).unwrap_or_default());
+    let ruta_actual = base.ruta.clone();
 
-    let respaldo = match crear_copia(&conn, &dir, "antes-de-restaurar") {
+    let respaldo = match crear_copia(&base.conn, &dir, "antes-de-restaurar").await {
         Ok(r) => r,
         Err(e) => {
-            *conn_guard = Some(conn);
+            *guard = Some(base);
             return Err(e);
         }
     };
 
-    // En Windows el archivo no se puede reemplazar mientras la conexión esté abierta.
-    if let Err((conn, e)) = conn.close() {
-        *conn_guard = Some(conn);
-        return Err(format!("No se pudo cerrar la base de datos: {}", e));
-    }
+    // En Windows el archivo no se puede reemplazar mientras la conexión esté abierta: al soltar
+    // `base` se cierran la conexión y la base.
+    drop(base);
     for sufijo in ["-wal", "-shm", "-journal"] {
         let _ = std::fs::remove_file(format!("{}{}", ruta_actual.display(), sufijo));
     }
 
     // Copia y reabre; si algo falla, vuelve a dejar la base como estaba.
-    let resultado = std::fs::copy(&origen, &ruta_actual)
-        .map_err(|e| format!("No se pudo restaurar la copia: {}", e))
-        .and_then(|_| abrir_base_de_datos(ruta_actual.clone()).map_err(|e| e.to_string()));
+    let resultado = match std::fs::copy(&origen, &ruta_actual) {
+        Ok(_) => abrir_base_de_datos(ruta_actual.clone()).await.map_err(|e| e.to_string()),
+        Err(e) => Err(format!("No se pudo restaurar la copia: {}", e)),
+    };
 
-    let conn = match resultado {
-        Ok(conn) => conn,
+    let base = match resultado {
+        Ok(base) => base,
         Err(e) => {
             let _ = std::fs::copy(&respaldo, &ruta_actual);
-            if let Ok(conn) = abrir_base_de_datos(ruta_actual.clone()) {
-                *conn_guard = Some(conn);
+            if let Ok(base) = abrir_base_de_datos(ruta_actual.clone()).await {
+                *guard = Some(base);
             }
             return Err(e);
         }
     };
 
-    // La conexión se guarda antes de leer la info: si eso fallara, la app no debe quedar sin base.
-    let info = info_de_conexion(&conn).map_err(|e| e.to_string());
-    *conn_guard = Some(conn);
-    info
+    // La base se guarda antes de leer la info: si eso fallara, la app no debe quedar sin base.
+    *guard = Some(base);
+    let base = guard.as_ref().expect("recién guardada");
+    info_de_conexion(base).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1080,20 +1097,19 @@ fn abrir_carpeta_copias(app: tauri::AppHandle) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-fn listar_categorias(conn: &Connection) -> rusqlite::Result<Vec<String>> {
-    let mut stmt = conn.prepare("SELECT nombre FROM categorias ORDER BY nombre")?;
-    stmt.query_map([], |row| row.get(0))?.collect()
+async fn listar_categorias(conn: &Connection) -> libsql::Result<Vec<String>> {
+    filas(conn, "SELECT nombre FROM categorias ORDER BY nombre", (), |row| row.col(0)).await
 }
 
 #[tauri::command]
-fn obtener_categorias(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
-    let conn_guard = state.db.lock().unwrap();
-    let conn = requerir_conexion(&conn_guard)?;
-    listar_categorias(conn).map_err(|e| e.to_string())
+async fn obtener_categorias(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
+    let guard = state.db.lock().await;
+    let conn = requerir_conexion(&guard)?;
+    listar_categorias(conn).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn agregar_categoria(
+async fn agregar_categoria(
     state: tauri::State<'_, AppState>,
     nombre: String,
 ) -> Result<Vec<String>, String> {
@@ -1102,9 +1118,10 @@ fn agregar_categoria(
         return Err("Escribe un nombre de categoría.".to_string());
     }
 
-    let conn_guard = state.db.lock().unwrap();
-    let conn = requerir_conexion(&conn_guard)?;
+    let guard = state.db.lock().await;
+    let conn = requerir_conexion(&guard)?;
     conn.execute("INSERT INTO categorias (nombre) VALUES (?1)", params![nombre])
+        .await
         .map_err(|e| {
             if es_duplicado(&e) {
                 "Esa categoría ya existe.".to_string()
@@ -1113,13 +1130,13 @@ fn agregar_categoria(
             }
         })?;
 
-    listar_categorias(conn).map_err(|e| e.to_string())
+    listar_categorias(conn).await.map_err(|e| e.to_string())
 }
 
 // Renombra una categoría y actualiza todos los productos que la usaban (los productos guardan el
 // nombre como texto), en una sola transacción para que no queden datos a medias.
 #[tauri::command]
-fn renombrar_categoria(
+async fn renombrar_categoria(
     state: tauri::State<'_, AppState>,
     nombre_actual: String,
     nombre_nuevo: String,
@@ -1130,18 +1147,19 @@ fn renombrar_categoria(
         return Err("Escribe un nombre de categoría.".to_string());
     }
 
-    let conn_guard = state.db.lock().unwrap();
-    let conn = requerir_conexion(&conn_guard)?;
+    let guard = state.db.lock().await;
+    let conn = requerir_conexion(&guard)?;
     if nombre_actual == nombre_nuevo {
-        return listar_categorias(conn).map_err(|e| e.to_string());
+        return listar_categorias(conn).await.map_err(|e| e.to_string());
     }
 
-    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
-    let filas = tx
+    let tx = conn.transaction().await.map_err(|e| e.to_string())?;
+    let cambiadas = tx
         .execute(
             "UPDATE categorias SET nombre = ?1 WHERE nombre = ?2",
-            params![nombre_nuevo, nombre_actual],
+            params![nombre_nuevo.as_str(), nombre_actual.as_str()],
         )
+        .await
         .map_err(|e| {
             if es_duplicado(&e) {
                 "Ya existe una categoría con ese nombre.".to_string()
@@ -1149,31 +1167,37 @@ fn renombrar_categoria(
                 e.to_string()
             }
         })?;
-    if filas == 0 {
+    if cambiadas == 0 {
         return Err("La categoría no existe.".to_string());
     }
     tx.execute(
         "UPDATE productos SET categoria = ?1 WHERE categoria = ?2",
         params![nombre_nuevo, nombre_actual],
     )
+    .await
     .map_err(|e| e.to_string())?;
-    tx.commit().map_err(|e| e.to_string())?;
+    tx.commit().await.map_err(|e| e.to_string())?;
 
-    listar_categorias(conn).map_err(|e| e.to_string())
+    listar_categorias(conn).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn eliminar_categoria(
+async fn eliminar_categoria(
     state: tauri::State<'_, AppState>,
     nombre: String,
 ) -> Result<Vec<String>, String> {
-    let conn_guard = state.db.lock().unwrap();
-    let conn = requerir_conexion(&conn_guard)?;
+    let guard = state.db.lock().await;
+    let conn = requerir_conexion(&guard)?;
     // Los productos guardan el nombre de la categoría como texto: si se borrara una en uso, esos
     // productos quedarían con una categoría que ya no aparece en los filtros ni en el formulario.
-    let en_uso: i64 = conn
-        .query_row("SELECT COUNT(*) FROM productos WHERE categoria = ?1", params![nombre], |row| row.get(0))
-        .map_err(|e| e.to_string())?;
+    let en_uso: i64 = fila(
+        conn,
+        "SELECT COUNT(*) FROM productos WHERE categoria = ?1",
+        params![nombre.as_str()],
+        |row| row.col(0),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     if en_uso > 0 {
         return Err(format!(
             "No se puede eliminar {}: la usa{} {} producto{}. Cámbiales la categoría o renómbrala.",
@@ -1184,63 +1208,69 @@ fn eliminar_categoria(
         ));
     }
     conn.execute("DELETE FROM categorias WHERE nombre = ?1", params![nombre])
+        .await
         .map_err(|e| e.to_string())?;
 
-    listar_categorias(conn).map_err(|e| e.to_string())
+    listar_categorias(conn).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn obtener_productos(
+async fn obtener_productos(
     state: tauri::State<'_, AppState>,
     pagina: i64,
     busqueda: Option<String>,
     categoria_filtro: Option<String>,
 ) -> Result<PaginaProductos, String> {
-    let conn_guard = state.db.lock().unwrap();
-    let conn = requerir_conexion(&conn_guard)?;
-    listar_pagina(conn, pagina, &busqueda, &categoria_filtro, &None, "id DESC").map_err(|e| e.to_string())
+    let guard = state.db.lock().await;
+    let conn = requerir_conexion(&guard)?;
+    listar_pagina(conn, pagina, &busqueda, &categoria_filtro, &None, "id DESC")
+        .await
+        .map_err(|e| e.to_string())
 }
 
 // Vista de solo lectura para Inventario: mismo listado paginado/filtrado, pero ordenado por menor
 // stock primero, para detectar rápido qué está bajo o sin stock.
 #[tauri::command]
-fn obtener_inventario(
+async fn obtener_inventario(
     state: tauri::State<'_, AppState>,
     pagina: i64,
     busqueda: Option<String>,
     categoria_filtro: Option<String>,
     estado_stock: Option<String>,
 ) -> Result<PaginaProductos, String> {
-    let conn_guard = state.db.lock().unwrap();
-    let conn = requerir_conexion(&conn_guard)?;
+    let guard = state.db.lock().await;
+    let conn = requerir_conexion(&guard)?;
     listar_pagina(conn, pagina, &busqueda, &categoria_filtro, &estado_stock, "stock ASC, id DESC")
+        .await
         .map_err(|e| e.to_string())
 }
 
-fn obtener_stock_actual(conn: &Connection, id: i64) -> rusqlite::Result<i32> {
-    conn.query_row("SELECT stock FROM productos WHERE id = ?1", params![id], |row| row.get(0))
+// Stock actual del producto, o None si ya no existe.
+async fn obtener_stock_actual(conn: &Connection, id: i64) -> libsql::Result<Option<i32>> {
+    una_fila(conn, "SELECT stock FROM productos WHERE id = ?1", params![id], |row| row.col(0)).await
 }
 
 // Deja constancia del movimiento (entrada o salida) en el historial de stock del producto.
-fn registrar_movimiento(
+async fn registrar_movimiento(
     conn: &Connection,
     producto_id: i64,
     tipo: &str,
     cantidad: i32,
     stock_resultante: i32,
-) -> rusqlite::Result<()> {
+) -> libsql::Result<()> {
     conn.execute(
         "INSERT INTO movimientos_stock (producto_id, tipo, cantidad, stock_resultante, fecha)
          VALUES (?1, ?2, ?3, ?4, datetime('now', 'localtime'))",
         params![producto_id, tipo, cantidad, stock_resultante],
-    )?;
+    )
+    .await?;
     Ok(())
 }
 
 // Suma stock a un producto existente (p. ej. al recibir mercadería), sin pasar por el formulario
 // completo de edición.
 #[tauri::command]
-fn agregar_stock(
+async fn agregar_stock(
     state: tauri::State<'_, AppState>,
     id: i64,
     cantidad: i32,
@@ -1253,12 +1283,12 @@ fn agregar_stock(
         return Err("La cantidad a agregar debe ser mayor a 0.".to_string());
     }
 
-    let conn_guard = state.db.lock().unwrap();
-    let conn = requerir_conexion(&conn_guard)?;
+    let guard = state.db.lock().await;
+    let conn = requerir_conexion(&guard)?;
     // Stock y movimiento juntos: o se guardan los dos o ninguno.
-    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let tx = conn.transaction().await.map_err(|e| e.to_string())?;
     let stock_actual = obtener_stock_actual(&tx, id)
-        .optional()
+        .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "El producto ya no existe.".to_string())?;
     let stock_resultante = stock_actual
@@ -1268,17 +1298,21 @@ fn agregar_stock(
         "UPDATE productos SET stock = ?1 WHERE id = ?2",
         params![stock_resultante, id],
     )
+    .await
     .map_err(|e| e.to_string())?;
-    registrar_movimiento(&tx, id, "ENTRADA", cantidad, stock_resultante).map_err(|e| e.to_string())?;
-    tx.commit().map_err(|e| e.to_string())?;
+    registrar_movimiento(&tx, id, "ENTRADA", cantidad, stock_resultante)
+        .await
+        .map_err(|e| e.to_string())?;
+    tx.commit().await.map_err(|e| e.to_string())?;
 
     listar_pagina(conn, pagina, &busqueda, &categoria_filtro, &estado_stock, "stock ASC, id DESC")
+        .await
         .map_err(|e| e.to_string())
 }
 
 // Resta stock de un producto existente (p. ej. una venta o un ajuste). No permite bajar de 0.
 #[tauri::command]
-fn quitar_stock(
+async fn quitar_stock(
     state: tauri::State<'_, AppState>,
     id: i64,
     cantidad: i32,
@@ -1291,12 +1325,12 @@ fn quitar_stock(
         return Err("La cantidad a quitar debe ser mayor a 0.".to_string());
     }
 
-    let conn_guard = state.db.lock().unwrap();
-    let conn = requerir_conexion(&conn_guard)?;
-    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let guard = state.db.lock().await;
+    let conn = requerir_conexion(&guard)?;
+    let tx = conn.transaction().await.map_err(|e| e.to_string())?;
 
     let stock_actual = obtener_stock_actual(&tx, id)
-        .optional()
+        .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "El producto ya no existe.".to_string())?;
     if cantidad > stock_actual {
@@ -1308,46 +1342,48 @@ fn quitar_stock(
         "UPDATE productos SET stock = ?1 WHERE id = ?2",
         params![stock_resultante, id],
     )
+    .await
     .map_err(|e| e.to_string())?;
-    registrar_movimiento(&tx, id, "SALIDA", cantidad, stock_resultante).map_err(|e| e.to_string())?;
-    tx.commit().map_err(|e| e.to_string())?;
+    registrar_movimiento(&tx, id, "SALIDA", cantidad, stock_resultante)
+        .await
+        .map_err(|e| e.to_string())?;
+    tx.commit().await.map_err(|e| e.to_string())?;
 
     listar_pagina(conn, pagina, &busqueda, &categoria_filtro, &estado_stock, "stock ASC, id DESC")
+        .await
         .map_err(|e| e.to_string())
 }
 
 // Historial de movimientos de un producto, más recientes primero.
 #[tauri::command]
-fn obtener_movimientos(
+async fn obtener_movimientos(
     state: tauri::State<'_, AppState>,
     producto_id: i64,
 ) -> Result<Vec<Movimiento>, String> {
-    let conn_guard = state.db.lock().unwrap();
-    let conn = requerir_conexion(&conn_guard)?;
+    let guard = state.db.lock().await;
+    let conn = requerir_conexion(&guard)?;
 
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, tipo, cantidad, stock_resultante, fecha
-             FROM movimientos_stock WHERE producto_id = ?1 ORDER BY id DESC",
-        )
-        .map_err(|e| e.to_string())?;
-
-    stmt.query_map(params![producto_id], |row| {
-        Ok(Movimiento {
-            id: row.get(0)?,
-            tipo: row.get(1)?,
-            cantidad: row.get(2)?,
-            stock_resultante: row.get(3)?,
-            fecha: row.get(4)?,
-        })
-    })
-    .map_err(|e| e.to_string())?
-    .collect::<rusqlite::Result<Vec<_>>>()
+    filas(
+        conn,
+        "SELECT id, tipo, cantidad, stock_resultante, fecha
+         FROM movimientos_stock WHERE producto_id = ?1 ORDER BY id DESC",
+        params![producto_id],
+        |row| {
+            Ok(Movimiento {
+                id: row.col(0)?,
+                tipo: row.col(1)?,
+                cantidad: row.col(2)?,
+                stock_resultante: row.col(3)?,
+                fecha: row.col(4)?,
+            })
+        },
+    )
+    .await
     .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn agregar_producto(
+async fn agregar_producto(
     state: tauri::State<'_, AppState>,
     codigo: String,
     detalle: String,
@@ -1364,23 +1400,26 @@ fn agregar_producto(
     let medida = limpiar_opcional(medida).unwrap_or_default();
     let aplicacion = limpiar_opcional(aplicacion).unwrap_or_default();
 
-    let conn_guard = state.db.lock().unwrap();
-    let conn = requerir_conexion(&conn_guard)?;
+    let guard = state.db.lock().await;
+    let conn = requerir_conexion(&guard)?;
     // El stock inicial siempre es 0: se gestiona exclusivamente desde Inventario.
     conn.execute(
         "INSERT INTO productos (codigo, detalle, categoria, precio, iva, stock, medida, aplicacion)
          VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)",
         params![codigo, detalle, categoria, precio, iva, medida, aplicacion],
     )
+    .await
     .map_err(mapear_error_guardado)?;
 
     // El producto nuevo queda primero (orden por id descendente), así que mostramos la página 1
     // respetando los filtros que el usuario tenga activos.
-    listar_pagina(conn, 1, &busqueda, &categoria_filtro, &None, "id DESC").map_err(|e| e.to_string())
+    listar_pagina(conn, 1, &busqueda, &categoria_filtro, &None, "id DESC")
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn actualizar_producto(
+async fn actualizar_producto(
     state: tauri::State<'_, AppState>,
     id: i64,
     pagina: i64,
@@ -1400,8 +1439,8 @@ fn actualizar_producto(
     let medida = limpiar_opcional(medida);
     let aplicacion = limpiar_opcional(aplicacion);
 
-    let conn_guard = state.db.lock().unwrap();
-    let conn = requerir_conexion(&conn_guard)?;
+    let guard = state.db.lock().await;
+    let conn = requerir_conexion(&guard)?;
     // El stock no se toca aquí: se gestiona exclusivamente desde Inventario.
     conn.execute(
         "UPDATE productos SET codigo = ?1, detalle = ?2, categoria = ?3, precio = ?4, iva = ?5,
@@ -1409,32 +1448,39 @@ fn actualizar_producto(
          WHERE id = ?6",
         params![codigo, detalle, categoria, precio, iva, id, medida, aplicacion],
     )
+    .await
     .map_err(mapear_error_guardado)?;
 
-    listar_pagina(conn, pagina, &busqueda, &categoria_filtro, &None, "id DESC").map_err(|e| e.to_string())
+    listar_pagina(conn, pagina, &busqueda, &categoria_filtro, &None, "id DESC")
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn eliminar_producto(
+async fn eliminar_producto(
     state: tauri::State<'_, AppState>,
     id: i64,
     pagina: i64,
     busqueda: Option<String>,
     categoria_filtro: Option<String>,
 ) -> Result<PaginaProductos, String> {
-    let conn_guard = state.db.lock().unwrap();
-    let conn = requerir_conexion(&conn_guard)?;
-    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let guard = state.db.lock().await;
+    let conn = requerir_conexion(&guard)?;
+    let tx = conn.transaction().await.map_err(|e| e.to_string())?;
     tx.execute(
         "DELETE FROM movimientos_stock WHERE producto_id = ?1",
         params![id],
     )
+    .await
     .map_err(|e| e.to_string())?;
     tx.execute("DELETE FROM productos WHERE id = ?1", params![id])
+        .await
         .map_err(|e| e.to_string())?;
-    tx.commit().map_err(|e| e.to_string())?;
+    tx.commit().await.map_err(|e| e.to_string())?;
 
-    listar_pagina(conn, pagina, &busqueda, &categoria_filtro, &None, "id DESC").map_err(|e| e.to_string())
+    listar_pagina(conn, pagina, &busqueda, &categoria_filtro, &None, "id DESC")
+        .await
+        .map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1537,37 +1583,37 @@ const SELECT_VENTA: &str = "SELECT v.id, v.fecha, v.subtotal_cero, v.subtotal_iv
             v.credito, v.devolucion_id
      FROM ventas v";
 
-fn mapear_venta(row: &rusqlite::Row) -> rusqlite::Result<Venta> {
+fn mapear_venta(row: &Row) -> libsql::Result<Venta> {
     Ok(Venta {
-        id: row.get(0)?,
-        fecha: row.get(1)?,
-        subtotal_cero: row.get(2)?,
-        subtotal_iva5: row.get(3)?,
-        subtotal_iva15: row.get(4)?,
-        iva5: row.get(5)?,
-        iva15: row.get(6)?,
-        total: row.get(7)?,
-        pago: row.get(8)?,
-        cambio: row.get(9)?,
-        unidades: row.get(10)?,
-        descuento: row.get(11)?,
-        cliente_nombre: row.get(12)?,
-        cliente_identificacion: row.get(13)?,
-        total_devuelto: redondear_monto(row.get(14)?),
-        credito: row.get(15)?,
-        devolucion_id: row.get(16)?,
+        id: row.col(0)?,
+        fecha: row.col(1)?,
+        subtotal_cero: row.col(2)?,
+        subtotal_iva5: row.col(3)?,
+        subtotal_iva15: row.col(4)?,
+        iva5: row.col(5)?,
+        iva15: row.col(6)?,
+        total: row.col(7)?,
+        pago: row.col(8)?,
+        cambio: row.col(9)?,
+        unidades: row.col(10)?,
+        descuento: row.col(11)?,
+        cliente_nombre: row.col(12)?,
+        cliente_identificacion: row.col(13)?,
+        total_devuelto: redondear_monto(row.col(14)?),
+        credito: row.col(15)?,
+        devolucion_id: row.col(16)?,
     })
 }
 
 // Búsqueda rápida para el punto de venta: por código o detalle, con la coincidencia exacta de
 // código primero (útil con lector de código de barras). Sin texto, muestra los primeros productos.
 #[tauri::command]
-fn buscar_productos_venta(
+async fn buscar_productos_venta(
     state: tauri::State<'_, AppState>,
     busqueda: Option<String>,
 ) -> Result<Vec<Producto>, String> {
-    let conn_guard = state.db.lock().unwrap();
-    let conn = requerir_conexion(&conn_guard)?;
+    let guard = state.db.lock().await;
+    let conn = requerir_conexion(&guard)?;
 
     let texto = busqueda
         .as_deref()
@@ -1579,18 +1625,14 @@ fn buscar_productos_venta(
     valores.push((":texto", Value::Text(texto)));
     valores.push((":limite", Value::Integer(RESULTADOS_BUSQUEDA_VENTA)));
 
-    let mut stmt = conn
-        .prepare(&format!(
-            "SELECT {} FROM productos {}
-             ORDER BY CASE WHEN codigo = :texto THEN 0 ELSE 1 END, detalle
-             LIMIT :limite",
-            COLUMNAS_PRODUCTO, clausula
-        ))
-        .map_err(|e| e.to_string())?;
-
-    stmt.query_map(&como_parametros(&valores)[..], mapear_producto)
-        .map_err(|e| e.to_string())?
-        .collect::<rusqlite::Result<Vec<_>>>()
+    let sql = format!(
+        "SELECT {} FROM productos {}
+         ORDER BY CASE WHEN codigo = :texto THEN 0 ELSE 1 END, detalle
+         LIMIT :limite",
+        COLUMNAS_PRODUCTO, clausula
+    );
+    filas(conn, &sql, con_nombre(&valores), mapear_producto)
+        .await
         .map_err(|e| e.to_string())
 }
 
@@ -1600,22 +1642,22 @@ fn buscar_productos_venta(
 const MAX_PRODUCTOS_REFRESCO: usize = 500;
 
 #[tauri::command]
-fn obtener_productos_por_ids(state: tauri::State<'_, AppState>, ids: Vec<i64>) -> Result<Vec<Producto>, String> {
+async fn obtener_productos_por_ids(
+    state: tauri::State<'_, AppState>,
+    ids: Vec<i64>,
+) -> Result<Vec<Producto>, String> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
     if ids.len() > MAX_PRODUCTOS_REFRESCO {
         return Err("Demasiados productos.".to_string());
     }
-    let conn_guard = state.db.lock().unwrap();
-    let conn = requerir_conexion(&conn_guard)?;
+    let guard = state.db.lock().await;
+    let conn = requerir_conexion(&guard)?;
     let marcadores = vec!["?"; ids.len()].join(", ");
-    let mut stmt = conn
-        .prepare(&format!("SELECT {} FROM productos WHERE id IN ({})", COLUMNAS_PRODUCTO, marcadores))
-        .map_err(|e| e.to_string())?;
-    stmt.query_map(rusqlite::params_from_iter(ids.iter()), mapear_producto)
-        .map_err(|e| e.to_string())?
-        .collect::<rusqlite::Result<Vec<_>>>()
+    let sql = format!("SELECT {} FROM productos WHERE id IN ({})", COLUMNAS_PRODUCTO, marcadores);
+    filas(conn, &sql, libsql::params_from_iter(ids), mapear_producto)
+        .await
         .map_err(|e| e.to_string())
 }
 
@@ -1623,7 +1665,7 @@ fn obtener_productos_por_ids(state: tauri::State<'_, AppState>, ids: Vec<i64>) -
 // precios actuales de la base (no con los que manda el frontend), descuenta stock y deja el
 // movimiento en el historial de cada producto. Si algo falla, no se guarda nada.
 #[tauri::command]
-fn registrar_venta(
+async fn registrar_venta(
     state: tauri::State<'_, AppState>,
     items: Vec<ItemVenta>,
     pago: f64,
@@ -1658,23 +1700,23 @@ fn registrar_venta(
         return Err("Ingresa un monto de pago válido.".to_string());
     }
 
-    let conn_guard = state.db.lock().unwrap();
-    let conn = requerir_conexion(&conn_guard)?;
-    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let guard = state.db.lock().await;
+    let conn = requerir_conexion(&guard)?;
+    let tx = conn.transaction().await.map_err(|e| e.to_string())?;
 
     // Cliente opcional: si viene, debe existir. Se guarda una copia de su nombre e identificación.
     let cliente: Option<(i64, String, String)> = match cliente_id {
         None => None,
         Some(id) => {
-            let fila = tx
-                .query_row(
-                    "SELECT id, nombre, identificacion FROM clientes WHERE id = ?1",
-                    params![id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .optional()
-                .map_err(|e| e.to_string())?;
-            match fila {
+            let encontrado = una_fila(
+                &tx,
+                "SELECT id, nombre, identificacion FROM clientes WHERE id = ?1",
+                params![id],
+                |row| Ok((row.col(0)?, row.col(1)?, row.col(2)?)),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            match encontrado {
                 Some(c) => Some(c),
                 None => return Err("El cliente seleccionado ya no existe.".to_string()),
             }
@@ -1703,25 +1745,25 @@ fn registrar_venta(
     for item in &items {
         let producto_id = item.producto_id;
         let cantidad = item.cantidad;
-        let fila = tx
-            .query_row(
-                "SELECT codigo, detalle, precio, iva, stock, medida FROM productos WHERE id = ?1",
-                params![producto_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, f64>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, i32>(4)?,
-                        row.get::<_, String>(5)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(|e| e.to_string())?;
+        let producto = una_fila(
+            &tx,
+            "SELECT codigo, detalle, precio, iva, stock, medida FROM productos WHERE id = ?1",
+            params![producto_id],
+            |row| {
+                Ok((
+                    row.col::<String>(0)?,
+                    row.col::<String>(1)?,
+                    row.col::<f64>(2)?,
+                    row.col::<String>(3)?,
+                    row.col::<i32>(4)?,
+                    row.col::<String>(5)?,
+                ))
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
 
-        let Some((codigo, detalle, precio, iva, stock, medida)) = fila else {
+        let Some((codigo, detalle, precio, iva, stock, medida)) = producto else {
             return Err("Uno de los productos de la venta ya no existe.".to_string());
         };
 
@@ -1784,7 +1826,7 @@ fn registrar_venta(
 
     let credito = match devolucion_id {
         None => 0,
-        Some(id) => credito_disponible(&tx, id)?,
+        Some(id) => credito_disponible(&tx, id).await?,
     };
 
     if pago_centavos + credito < total {
@@ -1817,6 +1859,7 @@ fn registrar_venta(
             de_centavos(credito),
         ],
     )
+    .await
     .map_err(|e| e.to_string())?;
     let venta_id = tx.last_insert_rowid();
 
@@ -1828,70 +1871,75 @@ fn registrar_venta(
             params![
                 venta_id,
                 linea.producto_id,
-                linea.codigo,
-                linea.detalle,
+                linea.codigo.as_str(),
+                linea.detalle.as_str(),
                 linea.cantidad,
                 de_centavos(linea.precio_centavos),
-                linea.iva,
+                linea.iva.as_str(),
                 de_centavos(linea.subtotal_centavos),
-                linea.medida,
+                linea.medida.as_str(),
                 de_centavos(linea.precio_lista_centavos),
                 linea.descuento_pct,
                 de_centavos(linea.descuento_centavos),
             ],
         )
+        .await
         .map_err(|e| e.to_string())?;
 
         tx.execute(
             "UPDATE productos SET stock = stock - ?1 WHERE id = ?2",
             params![linea.cantidad, linea.producto_id],
         )
+        .await
         .map_err(|e| e.to_string())?;
 
         registrar_movimiento(&tx, linea.producto_id, "VENTA", linea.cantidad, linea.stock - linea.cantidad)
+            .await
             .map_err(|e| e.to_string())?;
     }
 
-    tx.commit().map_err(|e| e.to_string())?;
+    tx.commit().await.map_err(|e| e.to_string())?;
 
-    conn.query_row(&format!("{} WHERE v.id = ?1", SELECT_VENTA), params![venta_id], mapear_venta)
+    fila(conn, &format!("{} WHERE v.id = ?1", SELECT_VENTA), params![venta_id], mapear_venta)
+        .await
         .map_err(|e| e.to_string())
 }
 
 // Historial de ventas paginado (más recientes primero), con el resumen del día.
 #[tauri::command]
-fn obtener_ventas(state: tauri::State<'_, AppState>, pagina: i64) -> Result<PaginaVentas, String> {
-    let conn_guard = state.db.lock().unwrap();
-    let conn = requerir_conexion(&conn_guard)?;
+async fn obtener_ventas(state: tauri::State<'_, AppState>, pagina: i64) -> Result<PaginaVentas, String> {
+    let guard = state.db.lock().await;
+    let conn = requerir_conexion(&guard)?;
 
-    let total: i64 = conn
-        .query_row("SELECT COUNT(*) FROM ventas", [], |row| row.get(0))
+    let total: i64 = fila(conn, "SELECT COUNT(*) FROM ventas", (), |row| row.col(0))
+        .await
         .map_err(|e| e.to_string())?;
     let total_paginas = ((total as f64) / (VENTAS_POR_PAGINA as f64)).ceil().max(1.0) as i64;
     let pagina = pagina.clamp(1, total_paginas);
     let offset = (pagina - 1) * VENTAS_POR_PAGINA;
 
-    let mut stmt = conn
-        .prepare(&format!("{} ORDER BY v.id DESC LIMIT ?1 OFFSET ?2", SELECT_VENTA))
-        .map_err(|e| e.to_string())?;
-    let ventas = stmt
-        .query_map(params![VENTAS_POR_PAGINA, offset], mapear_venta)
-        .map_err(|e| e.to_string())?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|e| e.to_string())?;
+    let ventas = filas(
+        conn,
+        &format!("{} ORDER BY v.id DESC LIMIT ?1 OFFSET ?2", SELECT_VENTA),
+        params![VENTAS_POR_PAGINA, offset],
+        mapear_venta,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
 
     // Monto neto del día: ventas menos devoluciones hechas hoy.
-    let (ventas_hoy, monto_hoy): (i64, f64) = conn
-        .query_row(
-            "SELECT COUNT(*), COALESCE(SUM(total), 0)
-                    - (SELECT COALESCE(SUM(total), 0) FROM devoluciones
-                       WHERE date(fecha) = date('now', 'localtime'))
-             FROM ventas
-             WHERE date(fecha) = date('now', 'localtime')",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(|e| e.to_string())?;
+    let (ventas_hoy, monto_hoy): (i64, f64) = fila(
+        conn,
+        "SELECT COUNT(*), COALESCE(SUM(total), 0)
+                - (SELECT COALESCE(SUM(total), 0) FROM devoluciones
+                   WHERE date(fecha) = date('now', 'localtime'))
+         FROM ventas
+         WHERE date(fecha) = date('now', 'localtime')",
+        (),
+        |row| Ok((row.col(0)?, row.col(1)?)),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
 
     Ok(PaginaVentas {
         ventas,
@@ -1903,40 +1951,38 @@ fn obtener_ventas(state: tauri::State<'_, AppState>, pagina: i64) -> Result<Pagi
 }
 
 #[tauri::command]
-fn obtener_detalle_venta(
+async fn obtener_detalle_venta(
     state: tauri::State<'_, AppState>,
     venta_id: i64,
 ) -> Result<Vec<DetalleVenta>, String> {
-    let conn_guard = state.db.lock().unwrap();
-    let conn = requerir_conexion(&conn_guard)?;
+    let guard = state.db.lock().await;
+    let conn = requerir_conexion(&guard)?;
 
-    let mut stmt = conn
-        .prepare(
-            "SELECT d.id, d.codigo, d.detalle, d.cantidad, d.precio_unitario, d.iva, d.subtotal, d.medida,
-                    d.precio_lista, d.descuento_pct, d.descuento,
-                    (SELECT COALESCE(SUM(dd.cantidad), 0) FROM devolucion_detalle dd WHERE dd.venta_detalle_id = d.id)
-             FROM venta_detalle d WHERE d.venta_id = ?1 ORDER BY d.id",
-        )
-        .map_err(|e| e.to_string())?;
-
-    stmt.query_map(params![venta_id], |row| {
-        Ok(DetalleVenta {
-            id: row.get(0)?,
-            codigo: row.get(1)?,
-            detalle: row.get(2)?,
-            cantidad: row.get(3)?,
-            precio_unitario: row.get(4)?,
-            iva: row.get(5)?,
-            subtotal: row.get(6)?,
-            medida: row.get(7)?,
-            precio_lista: row.get(8)?,
-            descuento_pct: row.get(9)?,
-            descuento: row.get(10)?,
-            devuelto: row.get(11)?,
-        })
-    })
-    .map_err(|e| e.to_string())?
-    .collect::<rusqlite::Result<Vec<_>>>()
+    filas(
+        conn,
+        "SELECT d.id, d.codigo, d.detalle, d.cantidad, d.precio_unitario, d.iva, d.subtotal, d.medida,
+                d.precio_lista, d.descuento_pct, d.descuento,
+                (SELECT COALESCE(SUM(dd.cantidad), 0) FROM devolucion_detalle dd WHERE dd.venta_detalle_id = d.id)
+         FROM venta_detalle d WHERE d.venta_id = ?1 ORDER BY d.id",
+        params![venta_id],
+        |row| {
+            Ok(DetalleVenta {
+                id: row.col(0)?,
+                codigo: row.col(1)?,
+                detalle: row.col(2)?,
+                cantidad: row.col(3)?,
+                precio_unitario: row.col(4)?,
+                iva: row.col(5)?,
+                subtotal: row.col(6)?,
+                medida: row.col(7)?,
+                precio_lista: row.col(8)?,
+                descuento_pct: row.col(9)?,
+                descuento: row.col(10)?,
+                devuelto: row.col(11)?,
+            })
+        },
+    )
+    .await
     .map_err(|e| e.to_string())
 }
 
@@ -1981,21 +2027,21 @@ const SELECT_DEVOLUCION: &str = "SELECT d.id, d.venta_id, d.fecha, d.motivo, d.r
             (SELECT v.id FROM ventas v WHERE v.devolucion_id = d.id)
      FROM devoluciones d";
 
-fn mapear_devolucion(row: &rusqlite::Row) -> rusqlite::Result<Devolucion> {
+fn mapear_devolucion(row: &Row) -> libsql::Result<Devolucion> {
     Ok(Devolucion {
-        id: row.get(0)?,
-        venta_id: row.get(1)?,
-        fecha: row.get(2)?,
-        motivo: row.get(3)?,
-        reembolso: row.get(4)?,
-        subtotal_cero: row.get(5)?,
-        subtotal_iva5: row.get(6)?,
-        subtotal_iva15: row.get(7)?,
-        iva5: row.get(8)?,
-        iva15: row.get(9)?,
-        total: row.get(10)?,
-        unidades: row.get(11)?,
-        usada_en_venta: row.get(12)?,
+        id: row.col(0)?,
+        venta_id: row.col(1)?,
+        fecha: row.col(2)?,
+        motivo: row.col(3)?,
+        reembolso: row.col(4)?,
+        subtotal_cero: row.col(5)?,
+        subtotal_iva5: row.col(6)?,
+        subtotal_iva15: row.col(7)?,
+        iva5: row.col(8)?,
+        iva15: row.col(9)?,
+        total: row.col(10)?,
+        unidades: row.col(11)?,
+        usada_en_venta: row.col(12)?,
     })
 }
 
@@ -2009,12 +2055,16 @@ fn proporcion(total: i64, parte: i64, de: i64) -> i64 {
 
 // Crédito (en centavos) de una devolución que se va a aplicar a una venta nueva. Debe ser de tipo
 // CAMBIO y no haberse usado antes.
-fn credito_disponible(conn: &Connection, devolucion_id: i64) -> Result<i64, String> {
-    let fila = conn
-        .query_row(&format!("{} WHERE d.id = ?1", SELECT_DEVOLUCION), params![devolucion_id], mapear_devolucion)
-        .optional()
-        .map_err(|e| e.to_string())?;
-    let Some(dev) = fila else {
+async fn credito_disponible(conn: &Connection, devolucion_id: i64) -> Result<i64, String> {
+    let encontrada = una_fila(
+        conn,
+        &format!("{} WHERE d.id = ?1", SELECT_DEVOLUCION),
+        params![devolucion_id],
+        mapear_devolucion,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    let Some(dev) = encontrada else {
         return Err("La devolución para el cambio ya no existe.".to_string());
     };
     if dev.reembolso != "CAMBIO" {
@@ -2033,7 +2083,7 @@ fn credito_disponible(conn: &Connection, devolucion_id: i64) -> Result<i64, Stri
 //   todo, la suma de devoluciones sea exactamente el total de la venta (sin diferencias de redondeo).
 // - Lo que regresa en buen estado vuelve al stock con un movimiento DEVOLUCION.
 #[tauri::command]
-fn registrar_devolucion(
+async fn registrar_devolucion(
     state: tauri::State<'_, AppState>,
     venta_id: i64,
     items: Vec<ItemDevolucion>,
@@ -2062,13 +2112,15 @@ fn registrar_devolucion(
         vistos.push(item.venta_detalle_id);
     }
 
-    let conn_guard = state.db.lock().unwrap();
-    let conn = requerir_conexion(&conn_guard)?;
-    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let guard = state.db.lock().await;
+    let conn = requerir_conexion(&guard)?;
+    let tx = conn.transaction().await.map_err(|e| e.to_string())?;
 
-    let existe: bool = tx
-        .query_row("SELECT COUNT(*) > 0 FROM ventas WHERE id = ?1", params![venta_id], |row| row.get(0))
-        .map_err(|e| e.to_string())?;
+    let existe: bool = fila(&tx, "SELECT COUNT(*) > 0 FROM ventas WHERE id = ?1", params![venta_id], |row| {
+        row.col(0)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
     if !existe {
         return Err("La venta ya no existe.".to_string());
     }
@@ -2089,28 +2141,29 @@ fn registrar_devolucion(
     let (mut sub_cero, mut sub_iva5, mut sub_iva15) = (0i64, 0i64, 0i64);
 
     for item in &items {
-        let fila = tx
-            .query_row(
-                "SELECT d.producto_id, d.codigo, d.detalle, d.cantidad, d.precio_unitario, d.iva, d.subtotal,
-                        (SELECT COALESCE(SUM(dd.cantidad), 0) FROM devolucion_detalle dd WHERE dd.venta_detalle_id = d.id)
-                 FROM venta_detalle d WHERE d.id = ?1 AND d.venta_id = ?2",
-                params![item.venta_detalle_id, venta_id],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, i32>(3)?,
-                        row.get::<_, f64>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, f64>(6)?,
-                        row.get::<_, i32>(7)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(|e| e.to_string())?;
-        let Some((producto_id, codigo, detalle, vendida, precio_unitario, iva, subtotal, devuelta)) = fila else {
+        let linea_venta = una_fila(
+            &tx,
+            "SELECT d.producto_id, d.codigo, d.detalle, d.cantidad, d.precio_unitario, d.iva, d.subtotal,
+                    (SELECT COALESCE(SUM(dd.cantidad), 0) FROM devolucion_detalle dd WHERE dd.venta_detalle_id = d.id)
+             FROM venta_detalle d WHERE d.id = ?1 AND d.venta_id = ?2",
+            params![item.venta_detalle_id, venta_id],
+            |row| {
+                Ok((
+                    row.col::<i64>(0)?,
+                    row.col::<String>(1)?,
+                    row.col::<String>(2)?,
+                    row.col::<i32>(3)?,
+                    row.col::<f64>(4)?,
+                    row.col::<String>(5)?,
+                    row.col::<f64>(6)?,
+                    row.col::<i32>(7)?,
+                ))
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        let Some((producto_id, codigo, detalle, vendida, precio_unitario, iva, subtotal, devuelta)) = linea_venta
+        else {
             return Err("Uno de los productos no pertenece a esta venta.".to_string());
         };
 
@@ -2134,8 +2187,11 @@ fn registrar_devolucion(
         }
 
         if item.regresa_stock {
-            let existe_producto: bool = tx
-                .query_row("SELECT COUNT(*) > 0 FROM productos WHERE id = ?1", params![producto_id], |row| row.get(0))
+            let existe_producto: bool =
+                fila(&tx, "SELECT COUNT(*) > 0 FROM productos WHERE id = ?1", params![producto_id], |row| {
+                    row.col(0)
+                })
+                .await
                 .map_err(|e| e.to_string())?;
             if !existe_producto {
                 return Err(format!(
@@ -2159,15 +2215,16 @@ fn registrar_devolucion(
     }
 
     // IVA acumulado: IVA de (lo ya devuelto + esta devolución) menos el IVA ya devuelto antes.
-    let (prev_base5, prev_iva5, prev_base15, prev_iva15): (f64, f64, f64, f64) = tx
-        .query_row(
-            "SELECT COALESCE(SUM(subtotal_iva5), 0), COALESCE(SUM(iva5), 0),
-                    COALESCE(SUM(subtotal_iva15), 0), COALESCE(SUM(iva15), 0)
-             FROM devoluciones WHERE venta_id = ?1",
-            params![venta_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .map_err(|e| e.to_string())?;
+    let (prev_base5, prev_iva5, prev_base15, prev_iva15): (f64, f64, f64, f64) = fila(
+        &tx,
+        "SELECT COALESCE(SUM(subtotal_iva5), 0), COALESCE(SUM(iva5), 0),
+                COALESCE(SUM(subtotal_iva15), 0), COALESCE(SUM(iva15), 0)
+         FROM devoluciones WHERE venta_id = ?1",
+        params![venta_id],
+        |row| Ok((row.col(0)?, row.col(1)?, row.col(2)?, row.col(3)?)),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     let iva5 = (calcular_iva(a_centavos(prev_base5) + sub_iva5, 5) - a_centavos(prev_iva5)).max(0);
     let iva15 = (calcular_iva(a_centavos(prev_base15) + sub_iva15, 15) - a_centavos(prev_iva15)).max(0);
     let total = sub_cero + sub_iva5 + sub_iva15 + iva5 + iva15;
@@ -2188,6 +2245,7 @@ fn registrar_devolucion(
             de_centavos(total),
         ],
     )
+    .await
     .map_err(|e| e.to_string())?;
     let devolucion_id = tx.last_insert_rowid();
 
@@ -2200,15 +2258,16 @@ fn registrar_devolucion(
                 devolucion_id,
                 linea.venta_detalle_id,
                 linea.producto_id,
-                linea.codigo,
-                linea.detalle,
+                linea.codigo.as_str(),
+                linea.detalle.as_str(),
                 linea.cantidad,
                 linea.precio_unitario,
-                linea.iva,
+                linea.iva.as_str(),
                 de_centavos(linea.subtotal_centavos),
                 linea.regresa_stock,
             ],
         )
+        .await
         .map_err(|e| e.to_string())?;
 
         if linea.regresa_stock {
@@ -2216,34 +2275,41 @@ fn registrar_devolucion(
                 "UPDATE productos SET stock = stock + ?1 WHERE id = ?2",
                 params![linea.cantidad, linea.producto_id],
             )
+            .await
             .map_err(|e| e.to_string())?;
-            let stock_resultante = obtener_stock_actual(&tx, linea.producto_id).map_err(|e| e.to_string())?;
+            let stock_resultante = obtener_stock_actual(&tx, linea.producto_id)
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("{} ya no existe en el catálogo.", linea.detalle))?;
             registrar_movimiento(&tx, linea.producto_id, "DEVOLUCION", linea.cantidad, stock_resultante)
+                .await
                 .map_err(|e| e.to_string())?;
         }
     }
 
-    tx.commit().map_err(|e| e.to_string())?;
+    tx.commit().await.map_err(|e| e.to_string())?;
 
-    conn.query_row(&format!("{} WHERE d.id = ?1", SELECT_DEVOLUCION), params![devolucion_id], mapear_devolucion)
+    fila(conn, &format!("{} WHERE d.id = ?1", SELECT_DEVOLUCION), params![devolucion_id], mapear_devolucion)
+        .await
         .map_err(|e| e.to_string())
 }
 
 // Devoluciones de una venta, más antiguas primero.
 #[tauri::command]
-fn obtener_devoluciones_venta(
+async fn obtener_devoluciones_venta(
     state: tauri::State<'_, AppState>,
     venta_id: i64,
 ) -> Result<Vec<Devolucion>, String> {
-    let conn_guard = state.db.lock().unwrap();
-    let conn = requerir_conexion(&conn_guard)?;
-    let mut stmt = conn
-        .prepare(&format!("{} WHERE d.venta_id = ?1 ORDER BY d.id", SELECT_DEVOLUCION))
-        .map_err(|e| e.to_string())?;
-    stmt.query_map(params![venta_id], mapear_devolucion)
-        .map_err(|e| e.to_string())?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|e| e.to_string())
+    let guard = state.db.lock().await;
+    let conn = requerir_conexion(&guard)?;
+    filas(
+        conn,
+        &format!("{} WHERE d.venta_id = ?1 ORDER BY d.id", SELECT_DEVOLUCION),
+        params![venta_id],
+        mapear_devolucion,
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -2336,8 +2402,9 @@ struct ResumenInventario {
     valor_inventario: f64,
 }
 
-fn resumen_inventario(conn: &Connection) -> rusqlite::Result<ResumenInventario> {
-    conn.query_row(
+async fn resumen_inventario(conn: &Connection) -> libsql::Result<ResumenInventario> {
+    fila(
+        conn,
         "SELECT COUNT(*),
                 COALESCE(SUM(CASE WHEN stock <= 0 THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN stock > 0 AND stock <= ?1 THEN 1 ELSE 0 END), 0),
@@ -2347,41 +2414,43 @@ fn resumen_inventario(conn: &Connection) -> rusqlite::Result<ResumenInventario> 
         params![UMBRAL_STOCK_BAJO],
         |row| {
             Ok(ResumenInventario {
-                total_productos: row.get(0)?,
-                productos_sin_stock: row.get(1)?,
-                productos_stock_bajo: row.get(2)?,
-                unidades_en_stock: row.get(3)?,
-                valor_inventario: redondear_monto(row.get(4)?),
+                total_productos: row.col(0)?,
+                productos_sin_stock: row.col(1)?,
+                productos_stock_bajo: row.col(2)?,
+                unidades_en_stock: row.col(3)?,
+                valor_inventario: redondear_monto(row.col(4)?),
             })
         },
     )
+    .await
 }
 
 #[tauri::command]
-fn obtener_resumen_inventario(state: tauri::State<'_, AppState>) -> Result<ResumenInventario, String> {
-    let conn_guard = state.db.lock().unwrap();
-    let conn = requerir_conexion(&conn_guard)?;
-    resumen_inventario(conn).map_err(|e| e.to_string())
+async fn obtener_resumen_inventario(state: tauri::State<'_, AppState>) -> Result<ResumenInventario, String> {
+    let guard = state.db.lock().await;
+    let conn = requerir_conexion(&guard)?;
+    resumen_inventario(conn).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn obtener_resumen_panel(state: tauri::State<'_, AppState>) -> Result<ResumenPanel, String> {
-    let conn_guard = state.db.lock().unwrap();
-    let conn = requerir_conexion(&conn_guard)?;
-    resumen_panel(conn).map_err(|e| e.to_string())
+async fn obtener_resumen_panel(state: tauri::State<'_, AppState>) -> Result<ResumenPanel, String> {
+    let guard = state.db.lock().await;
+    let conn = requerir_conexion(&guard)?;
+    resumen_panel(conn).await.map_err(|e| e.to_string())
 }
 
-fn resumen_panel(conn: &Connection) -> rusqlite::Result<ResumenPanel> {
+async fn resumen_panel(conn: &Connection) -> libsql::Result<ResumenPanel> {
     let ResumenInventario {
         total_productos,
         productos_sin_stock,
         productos_stock_bajo,
         unidades_en_stock,
         valor_inventario,
-    } = resumen_inventario(conn)?;
+    } = resumen_inventario(conn).await?;
 
     // Un registro por cada uno de los últimos N días, incluidos los días sin ventas (en 0).
-    let mut stmt = conn.prepare(
+    let ventas_por_dia = filas(
+        conn,
         "WITH RECURSIVE dias(d) AS (
              SELECT date('now', 'localtime', ?1)
              UNION ALL
@@ -2393,18 +2462,19 @@ fn resumen_panel(conn: &Connection) -> rusqlite::Result<ResumenPanel> {
                 COUNT(v.id)
          FROM dias LEFT JOIN ventas v ON date(v.fecha) = dias.d
          GROUP BY dias.d ORDER BY dias.d",
-    )?;
-    let ventas_por_dia = stmt
-        .query_map(params![format!("-{} days", DIAS_GRAFICO_VENTAS - 1)], |row| {
+        params![format!("-{} days", DIAS_GRAFICO_VENTAS - 1)],
+        |row| {
             Ok(VentasDia {
-                fecha: row.get(0)?,
-                total: redondear_monto(row.get(1)?),
-                cantidad: row.get(2)?,
+                fecha: row.col(0)?,
+                total: redondear_monto(row.col(1)?),
+                cantidad: row.col(2)?,
             })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+        },
+    )
+    .await?;
 
-    let mut stmt = conn.prepare(
+    let mas_vendidos = filas(
+        conn,
         // Unidades y montos netos de lo devuelto.
         "SELECT d.codigo, d.detalle,
                 SUM(d.cantidad - COALESCE(dd.cantidad, 0)) AS unidades,
@@ -2417,37 +2487,36 @@ fn resumen_panel(conn: &Connection) -> rusqlite::Result<ResumenPanel> {
          HAVING unidades > 0
          ORDER BY unidades DESC, monto DESC
          LIMIT 5",
-    )?;
-    let mas_vendidos = stmt
-        .query_map([], |row| {
+        (),
+        |row| {
             Ok(ProductoVendido {
-                codigo: row.get(0)?,
-                detalle: row.get(1)?,
-                unidades: row.get(2)?,
-                monto: redondear_monto(row.get(3)?),
+                codigo: row.col(0)?,
+                detalle: row.col(1)?,
+                unidades: row.col(2)?,
+                monto: redondear_monto(row.col(3)?),
             })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+        },
+    )
+    .await?;
 
-    let mut stmt = conn.prepare(
+    let alertas_stock = filas(
+        conn,
         "SELECT id, codigo, detalle, stock FROM productos
          WHERE stock <= ?1 ORDER BY stock ASC, detalle LIMIT 8",
-    )?;
-    let alertas_stock = stmt
-        .query_map(params![UMBRAL_STOCK_BAJO], |row| {
+        params![UMBRAL_STOCK_BAJO],
+        |row| {
             Ok(ProductoAlerta {
-                id: row.get(0)?,
-                codigo: row.get(1)?,
-                detalle: row.get(2)?,
-                stock: row.get(3)?,
+                id: row.col(0)?,
+                codigo: row.col(1)?,
+                detalle: row.col(2)?,
+                stock: row.col(3)?,
             })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+        },
+    )
+    .await?;
 
-    let mut stmt = conn.prepare(&format!("{} ORDER BY v.id DESC LIMIT 5", SELECT_VENTA))?;
-    let ultimas_ventas = stmt
-        .query_map([], mapear_venta)?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let ultimas_ventas =
+        filas(conn, &format!("{} ORDER BY v.id DESC LIMIT 5", SELECT_VENTA), (), mapear_venta).await?;
 
     Ok(ResumenPanel {
         total_productos,
@@ -2577,7 +2646,7 @@ fn preparar_cliente(
     })
 }
 
-fn mapear_error_cliente(err: rusqlite::Error) -> String {
+fn mapear_error_cliente(err: libsql::Error) -> String {
     if es_duplicado(&err) {
         return "Ya existe un cliente con esa identificación.".to_string();
     }
@@ -2601,65 +2670,64 @@ fn filtro_cliente(texto: &str) -> (String, Vec<(&'static str, Value)>) {
     }
 }
 
-fn mapear_cliente(row: &rusqlite::Row) -> rusqlite::Result<Cliente> {
-    let total: f64 = row.get(9)?;
+fn mapear_cliente(row: &Row) -> libsql::Result<Cliente> {
+    let total: f64 = row.col(9)?;
     Ok(Cliente {
-        id: row.get(0)?,
-        tipo_identificacion: row.get(1)?,
-        identificacion: row.get(2)?,
-        nombre: row.get(3)?,
-        telefono: row.get(4)?,
-        email: row.get(5)?,
-        direccion: row.get(6)?,
-        fecha_registro: row.get(7)?,
-        compras: row.get(8)?,
+        id: row.col(0)?,
+        tipo_identificacion: row.col(1)?,
+        identificacion: row.col(2)?,
+        nombre: row.col(3)?,
+        telefono: row.col(4)?,
+        email: row.col(5)?,
+        direccion: row.col(6)?,
+        fecha_registro: row.col(7)?,
+        compras: row.col(8)?,
         total_comprado: de_centavos(a_centavos(total)),
-        ultima_compra: row.get(10)?,
+        ultima_compra: row.col(10)?,
     })
 }
 
-fn obtener_cliente(conn: &Connection, id: i64) -> rusqlite::Result<Cliente> {
-    conn.query_row(
+async fn obtener_cliente(conn: &Connection, id: i64) -> libsql::Result<Cliente> {
+    fila(
+        conn,
         &format!("{} WHERE c.id = ?1 GROUP BY c.id", SELECT_CLIENTE),
         params![id],
         mapear_cliente,
     )
+    .await
 }
 
 #[tauri::command]
-fn obtener_clientes(
+async fn obtener_clientes(
     state: tauri::State<'_, AppState>,
     pagina: i64,
     busqueda: Option<String>,
 ) -> Result<PaginaClientes, String> {
-    let conn_guard = state.db.lock().unwrap();
-    let conn = requerir_conexion(&conn_guard)?;
+    let guard = state.db.lock().await;
+    let conn = requerir_conexion(&guard)?;
 
     let (filtro, mut valores) = filtro_cliente(busqueda.as_deref().unwrap_or(""));
 
-    let total: i64 = conn
-        .query_row(
-            &format!("SELECT COUNT(*) FROM clientes c {}", filtro),
-            &como_parametros(&valores)[..],
-            |row| row.get(0),
-        )
-        .map_err(|e| e.to_string())?;
+    let total: i64 = fila(
+        conn,
+        &format!("SELECT COUNT(*) FROM clientes c {}", filtro),
+        con_nombre(&valores),
+        |row| row.col(0),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     let total_paginas = ((total as f64) / (CLIENTES_POR_PAGINA as f64)).ceil().max(1.0) as i64;
     let pagina = pagina.clamp(1, total_paginas);
     let offset = (pagina - 1) * CLIENTES_POR_PAGINA;
 
-    let mut stmt = conn
-        .prepare(&format!(
-            "{} {} GROUP BY c.id ORDER BY c.nombre LIMIT :limite OFFSET :offset",
-            SELECT_CLIENTE, filtro
-        ))
-        .map_err(|e| e.to_string())?;
     valores.push((":limite", Value::Integer(CLIENTES_POR_PAGINA)));
     valores.push((":offset", Value::Integer(offset)));
-    let clientes = stmt
-        .query_map(&como_parametros(&valores)[..], mapear_cliente)
-        .map_err(|e| e.to_string())?
-        .collect::<rusqlite::Result<Vec<_>>>()
+    let sql = format!(
+        "{} {} GROUP BY c.id ORDER BY c.nombre LIMIT :limite OFFSET :offset",
+        SELECT_CLIENTE, filtro
+    );
+    let clientes = filas(conn, &sql, con_nombre(&valores), mapear_cliente)
+        .await
         .map_err(|e| e.to_string())?;
 
     Ok(PaginaClientes { clientes, total, pagina })
@@ -2667,29 +2735,26 @@ fn obtener_clientes(
 
 // Búsqueda rápida para elegir el cliente en una venta (identificación exacta primero).
 #[tauri::command]
-fn buscar_clientes(state: tauri::State<'_, AppState>, busqueda: String) -> Result<Vec<Cliente>, String> {
-    let conn_guard = state.db.lock().unwrap();
-    let conn = requerir_conexion(&conn_guard)?;
+async fn buscar_clientes(state: tauri::State<'_, AppState>, busqueda: String) -> Result<Vec<Cliente>, String> {
+    let guard = state.db.lock().await;
+    let conn = requerir_conexion(&guard)?;
 
     let (filtro, mut valores) = filtro_cliente(&busqueda);
     valores.push((":texto", Value::Text(busqueda.trim().to_uppercase())));
     valores.push((":limite", Value::Integer(RESULTADOS_BUSQUEDA_CLIENTE)));
-    let mut stmt = conn
-        .prepare(&format!(
-            "{} {} GROUP BY c.id
-             ORDER BY CASE WHEN c.identificacion = :texto THEN 0 ELSE 1 END, c.nombre
-             LIMIT :limite",
-            SELECT_CLIENTE, filtro
-        ))
-        .map_err(|e| e.to_string())?;
-    stmt.query_map(&como_parametros(&valores)[..], mapear_cliente)
-    .map_err(|e| e.to_string())?
-    .collect::<rusqlite::Result<Vec<_>>>()
-    .map_err(|e| e.to_string())
+    let sql = format!(
+        "{} {} GROUP BY c.id
+         ORDER BY CASE WHEN c.identificacion = :texto THEN 0 ELSE 1 END, c.nombre
+         LIMIT :limite",
+        SELECT_CLIENTE, filtro
+    );
+    filas(conn, &sql, con_nombre(&valores), mapear_cliente)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn agregar_cliente(
+async fn agregar_cliente(
     state: tauri::State<'_, AppState>,
     tipo_identificacion: String,
     identificacion: String,
@@ -2699,19 +2764,20 @@ fn agregar_cliente(
     direccion: Option<String>,
 ) -> Result<Cliente, String> {
     let d = preparar_cliente(tipo_identificacion, identificacion, nombre, telefono, email, direccion)?;
-    let conn_guard = state.db.lock().unwrap();
-    let conn = requerir_conexion(&conn_guard)?;
+    let guard = state.db.lock().await;
+    let conn = requerir_conexion(&guard)?;
     conn.execute(
         "INSERT INTO clientes (tipo_identificacion, identificacion, nombre, telefono, email, direccion, fecha_registro)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now', 'localtime'))",
         params![d.tipo_identificacion, d.identificacion, d.nombre, d.telefono, d.email, d.direccion],
     )
+    .await
     .map_err(mapear_error_cliente)?;
-    obtener_cliente(conn, conn.last_insert_rowid()).map_err(|e| e.to_string())
+    obtener_cliente(conn, conn.last_insert_rowid()).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn actualizar_cliente(
+async fn actualizar_cliente(
     state: tauri::State<'_, AppState>,
     id: i64,
     tipo_identificacion: String,
@@ -2722,43 +2788,50 @@ fn actualizar_cliente(
     direccion: Option<String>,
 ) -> Result<Cliente, String> {
     let d = preparar_cliente(tipo_identificacion, identificacion, nombre, telefono, email, direccion)?;
-    let conn_guard = state.db.lock().unwrap();
-    let conn = requerir_conexion(&conn_guard)?;
+    let guard = state.db.lock().await;
+    let conn = requerir_conexion(&guard)?;
     conn.execute(
         "UPDATE clientes SET tipo_identificacion = ?1, identificacion = ?2, nombre = ?3, telefono = ?4,
                 email = ?5, direccion = ?6
          WHERE id = ?7",
         params![d.tipo_identificacion, d.identificacion, d.nombre, d.telefono, d.email, d.direccion, id],
     )
+    .await
     .map_err(mapear_error_cliente)?;
-    obtener_cliente(conn, id).map_err(|e| e.to_string())
+    obtener_cliente(conn, id).await.map_err(|e| e.to_string())
 }
 
 // Elimina el cliente. Sus ventas se conservan (con la copia del nombre guardada en cada venta).
 #[tauri::command]
-fn eliminar_cliente(state: tauri::State<'_, AppState>, id: i64) -> Result<(), String> {
-    let conn_guard = state.db.lock().unwrap();
-    let conn = requerir_conexion(&conn_guard)?;
-    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+async fn eliminar_cliente(state: tauri::State<'_, AppState>, id: i64) -> Result<(), String> {
+    let guard = state.db.lock().await;
+    let conn = requerir_conexion(&guard)?;
+    let tx = conn.transaction().await.map_err(|e| e.to_string())?;
     tx.execute("UPDATE ventas SET cliente_id = NULL WHERE cliente_id = ?1", params![id])
+        .await
         .map_err(|e| e.to_string())?;
     tx.execute("DELETE FROM clientes WHERE id = ?1", params![id])
+        .await
         .map_err(|e| e.to_string())?;
-    tx.commit().map_err(|e| e.to_string())
+    tx.commit().await.map_err(|e| e.to_string())
 }
 
 // Compras de un cliente, más recientes primero.
 #[tauri::command]
-fn obtener_ventas_cliente(state: tauri::State<'_, AppState>, cliente_id: i64) -> Result<Vec<Venta>, String> {
-    let conn_guard = state.db.lock().unwrap();
-    let conn = requerir_conexion(&conn_guard)?;
-    let mut stmt = conn
-        .prepare(&format!("{} WHERE v.cliente_id = ?1 ORDER BY v.id DESC LIMIT 100", SELECT_VENTA))
-        .map_err(|e| e.to_string())?;
-    stmt.query_map(params![cliente_id], mapear_venta)
-        .map_err(|e| e.to_string())?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|e| e.to_string())
+async fn obtener_ventas_cliente(
+    state: tauri::State<'_, AppState>,
+    cliente_id: i64,
+) -> Result<Vec<Venta>, String> {
+    let guard = state.db.lock().await;
+    let conn = requerir_conexion(&guard)?;
+    filas(
+        conn,
+        &format!("{} WHERE v.cliente_id = ?1 ORDER BY v.id DESC LIMIT 100", SELECT_VENTA),
+        params![cliente_id],
+        mapear_venta,
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -2790,11 +2863,13 @@ pub fn run() {
 
             // Si ya existe una base de datos (de un inicio anterior) la abrimos; si no, queda sin
             // configurar hasta que el usuario le ponga nombre desde la pantalla de primer inicio.
-            let conn = buscar_base_existente(&dir)
-                .map(|ruta| abrir_base_de_datos(ruta).expect("no se pudo abrir la base de datos SQLite"));
+            let base = buscar_base_existente(&dir).map(|ruta| {
+                tauri::async_runtime::block_on(abrir_base_de_datos(ruta))
+                    .expect("no se pudo abrir la base de datos SQLite")
+            });
 
             app.manage(AppState {
-                db: Mutex::new(conn),
+                db: Mutex::new(base),
             });
 
             // La ventana arranca oculta ("visible": false) y el frontend la muestra cuando ya pintó
