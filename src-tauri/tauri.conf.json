@@ -1,0 +1,47 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Total Stock",
+  "version": "2.0.0",
+  "identifier": "com.usuario.app-desktop",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Total Stock",
+        "width": 800,
+        "height": 600,
+        "visible": false,
+        "decorations": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "publisher": "Jean Pierre",
+    "copyright": "© 2026 Jean Pierre. Todos los derechos reservados.",
+    "category": "Business",
+    "shortDescription": "Inventario, ventas y clientes",
+    "longDescription": "Total Stock: control de inventario, ventas, devoluciones y clientes.",
+    "windows": {
+      "nsis": {
+        "installerIcon": "icons/icon.ico"
+      }
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

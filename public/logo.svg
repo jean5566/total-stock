@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="133 133 1665 1665">
+  <!-- Logo Total Stock: "T" con barras de código + "S". Fuente para iconos: pnpm tauri icon public/logo.svg -->
+  <rect x="193" y="193" width="1545" height="1545" rx="320" fill="#1F4BB8"/>
+  <g fill="#FFFFFF">
+    <rect x="376" y="622" width="614" height="136" rx="14"/>
+    <rect x="610" y="758" width="40" height="555"/>
+    <rect x="675" y="758" width="80" height="555"/>
+    <rect x="434" y="820" width="53" height="493"/>
+    <rect x="511" y="820" width="20" height="493"/>
+    <rect x="560" y="820" width="21" height="493"/>
+    <rect x="809" y="820" width="20" height="493"/>
+    <rect x="879" y="820" width="52" height="493"/>
+    <path d="M1545 820 L1372 820 C1360 770 1335 747 1285 747 C1245 747 1215 772 1215 812 C1215 855 1260 875 1300 887 L1420 926 C1510 955 1557 1010 1557 1100 C1557 1230 1450 1315 1305 1315 C1150 1315 1040 1240 1040 1105 L1213 1105 C1222 1160 1255 1183 1302 1183 C1350 1183 1382 1160 1382 1118 C1382 1080 1355 1060 1300 1043 L1180 1005 C1095 978 1042 925 1042 822 C1042 700 1150 617 1295 617 C1440 617 1530 690 1545 820 Z"/>
+  </g>
+</svg>

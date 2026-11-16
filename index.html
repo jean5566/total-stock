@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/logo.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Total Stock</title>
+    <!-- Fondo inicial antes de que cargue el CSS, para evitar el destello blanco en modo oscuro.
+         Los colores coinciden con --background de :root y .dark en src/index.css. -->
+    <style>
+      html { background: #ffffff; }
+      html.dark { background: #0a0a0a; color-scheme: dark; }
+    </style>
+    <!-- Aplica el tema guardado ANTES del primer pintado (misma lógica que obtenerTemaInicial
+         en theme-provider.tsx; la clave "app-theme" debe coincidir con STORAGE_KEY). -->
+    <script>
+      (function () {
+        try {
+          var t = localStorage.getItem("app-theme");
+          if (t !== "light" && t !== "dark") {
+            t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+          }
+          if (t === "dark") document.documentElement.classList.add("dark");
+        } catch (e) {}
+      })();
+    </script>
+  </head>
+
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
