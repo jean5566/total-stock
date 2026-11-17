@@ -10,7 +10,9 @@ import {
   SidebarMenuButton,
   SidebarMenuItem,
   SidebarSeparator,
+  useSidebar,
 } from "@/components/ui/sidebar";
+import { esPlataformaMovil } from "@/lib/utils";
 import { NOMBRE_APP, useVersionApp } from "@/hooks/use-info-app";
 
 // Definimos los tipos de vistas disponibles en nuestra app
@@ -65,12 +67,20 @@ const sections: SidebarSection[] = [
 
 export function AppSidebar({ vistaActual, setVistaActual }: AppSidebarProps) {
   const version = useVersionApp();
+  const { isMobile, setOpenMobile } = useSidebar();
+
+  const irA = (vista: Vista) => {
+    setVistaActual(vista);
+    // En pantallas chicas el menú es un panel que tapa la vista: se cierra al elegir una sección
+    if (isMobile) setOpenMobile(false);
+  };
   return (
     <Sidebar
       variant="sidebar"
       collapsible="icon"
-      // Empieza debajo de la barra de título propia (h-9) en vez de en el borde de la ventana
-      className="top-9! h-[calc(100svh-2.25rem)]!"
+      // Empieza debajo de la barra de título propia (h-9) en vez de en el borde de la ventana.
+      // En el celular esa barra no existe, así que ocupa todo el alto.
+      className={esPlataformaMovil ? undefined : "top-9! h-[calc(100svh-2.25rem)]!"}
     >
       <SidebarContent>
         {sections.map((section, index) => (
@@ -86,7 +96,7 @@ export function AppSidebar({ vistaActual, setVistaActual }: AppSidebarProps) {
                 {section.items.map((item) => (
                   <SidebarMenuItem key={item.id}>
                     <SidebarMenuButton
-                      onClick={() => setVistaActual(item.id)}
+                      onClick={() => irA(item.id)}
                       isActive={vistaActual === item.id}
                       tooltip={item.title}
                     >

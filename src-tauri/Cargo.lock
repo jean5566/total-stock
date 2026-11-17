@@ -80,6 +80,8 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 name = "app-desktop"
 version = "2.0.0"
 dependencies = [
+ "hyper 0.14.32",
+ "hyper-rustls",
  "libsql",
  "rust_xlsxwriter",
  "serde",

@@ -17,6 +17,7 @@ import { dinero, entero, Indicador, plural } from "@/components/reporte-ui";
 import { Badge } from "@/components/ui/badge";
 import { AplicacionTexto, MedidaTag } from "@/components/medida-tag";
 import { placeholderBusqueda, useAjustes } from "@/hooks/use-ajustes";
+import { MENSAJE_SIN_CONEXION, useConexion } from "@/hooks/use-conexion";
 import { TablaSkeleton } from "@/components/tabla-skeleton";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -94,6 +95,8 @@ const FILTROS_STOCK = [
 ];
 
 export function InventarioView() {
+  const { sinConexion } = useConexion();
+  const tituloSinConexion = sinConexion ? MENSAJE_SIN_CONEXION : undefined;
   const [productos, setProductos] = useState<Producto[]>([]);
   const { ajustes } = useAjustes();
   const usarMedida = ajustes.usarMedida;
@@ -184,6 +187,7 @@ export function InventarioView() {
   const manejarGuardarStock = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!productoParaStock) return;
+    if (sinConexion) return;
 
     // Solo enteros positivos: "2.7" o "1e3" no se truncan en silencio
     const texto = cantidadStock.trim();
@@ -306,7 +310,7 @@ export function InventarioView() {
 
       {/* Búsqueda y filtro por categoría */}
       <div className="flex flex-wrap items-center gap-2">
-        <div className="relative flex-1 min-w-[220px]">
+        <div className="relative flex-1 min-w-full sm:min-w-[220px]">
           <Search className="absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
           <Input
             placeholder={placeholderBusqueda(ajustes)}
@@ -316,7 +320,7 @@ export function InventarioView() {
           />
         </div>
         <Select value={categoriaFiltro} onValueChange={(val) => setCategoriaFiltro(val ?? TODAS_CATEGORIAS)}>
-          <SelectTrigger className="w-[200px]">
+          <SelectTrigger className="flex-1 sm:w-[200px] sm:flex-none">
             <SelectValue placeholder="Categoría" />
           </SelectTrigger>
           <SelectContent>
@@ -327,7 +331,7 @@ export function InventarioView() {
           </SelectContent>
         </Select>
         <Select value={stockFiltro} onValueChange={(val) => setStockFiltro(val ?? TODOS_STOCK)}>
-          <SelectTrigger className="w-[180px]">
+          <SelectTrigger className="flex-1 sm:w-[180px] sm:flex-none">
             <SelectValue placeholder="Stock">
               {(val: string) => FILTROS_STOCK.find((f) => f.valor === val)?.etiqueta ?? "Stock"}
             </SelectValue>
@@ -369,7 +373,50 @@ export function InventarioView() {
                 : "No hay productos registrados."}
             </p>
           ) : (
-            <div className="border rounded-md overflow-x-auto">
+            <>
+            {/* Teléfono: una tarjeta por producto (la tabla no entra en una pantalla angosta) */}
+            <ul className="divide-y rounded-md border md:hidden">
+              {productos.map((prod) => (
+                <li key={prod.id} className="space-y-2 p-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0 uppercase">
+                      <div className="text-sm font-medium break-words">
+                        {prod.detalle}
+                        {usarMedida && prod.medida && <MedidaTag medida={prod.medida} />}
+                      </div>
+                      <div className="font-mono text-[11px] text-muted-foreground">
+                        {prod.codigo} · {prod.categoria}
+                      </div>
+                      {usarAplicacion && prod.aplicacion && <AplicacionTexto aplicacion={prod.aplicacion} />}
+                    </div>
+                    <div className="shrink-0 text-right">
+                      <div className="text-sm font-semibold tabular-nums">{prod.stock} u.</div>
+                      <EstadoStock stock={prod.stock} />
+                    </div>
+                  </div>
+                  <div className="flex justify-end gap-1">
+                    <Button type="button" variant="outline" size="sm" onClick={() => abrirDialogoStock(prod, "ENTRADA")} disabled={sinConexion} title={tituloSinConexion}>
+                      <PackagePlus className="h-3.5 w-3.5" />
+                      Agregar
+                    </Button>
+                    <Button type="button" variant="outline" size="sm" onClick={() => abrirDialogoStock(prod, "SALIDA")} disabled={sinConexion} title={tituloSinConexion}>
+                      <PackageMinus className="h-3.5 w-3.5" />
+                      Quitar
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="icon-sm"
+                      onClick={() => abrirHistorial(prod)}
+                      aria-label={`Ver historial de ${prod.detalle}`}
+                    >
+                      <History className="h-3.5 w-3.5" />
+                    </Button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+            <div className="hidden overflow-x-auto rounded-md border md:block">
               <Table>
                 <TableHeader>
                   <TableRow>
@@ -393,15 +440,7 @@ export function InventarioView() {
                       <TableCell className="text-sm text-muted-foreground uppercase">{prod.categoria}</TableCell>
                       <TableCell className="text-right text-sm font-semibold">{prod.stock} u.</TableCell>
                       <TableCell className="text-center text-sm">
-                        {prod.stock === 0 ? (
-                          <Badge variant="destructive" className="text-[11px]">Sin stock</Badge>
-                        ) : prod.stock <= UMBRAL_STOCK_BAJO ? (
-                          <Badge variant="outline" className="border-amber-500 text-[11px] text-amber-600 dark:text-amber-400">
-                            Stock bajo
-                          </Badge>
-                        ) : (
-                          <Badge variant="secondary" className="text-[11px]">OK</Badge>
-                        )}
+                        <EstadoStock stock={prod.stock} />
                       </TableCell>
                       <TableCell className="text-right">
                         <div className="flex justify-end gap-1">
@@ -410,6 +449,8 @@ export function InventarioView() {
                             variant="ghost"
                             size="icon-sm"
                             onClick={() => abrirDialogoStock(prod, "ENTRADA")}
+                            disabled={sinConexion}
+                            title={tituloSinConexion}
                             aria-label={`Agregar stock a ${prod.detalle}`}
                           >
                             <PackagePlus className="h-3.5 w-3.5" />
@@ -419,6 +460,8 @@ export function InventarioView() {
                             variant="ghost"
                             size="icon-sm"
                             onClick={() => abrirDialogoStock(prod, "SALIDA")}
+                            disabled={sinConexion}
+                            title={tituloSinConexion}
                             aria-label={`Quitar stock a ${prod.detalle}`}
                           >
                             <PackageMinus className="h-3.5 w-3.5" />
@@ -439,13 +482,14 @@ export function InventarioView() {
                 </TableBody>
               </Table>
             </div>
+            </>
           )}
           </div>
           </AltoAnimado>
         </CardContent>
 
         {totalProductos > 0 && (
-          <CardFooter className="flex items-center justify-between">
+          <CardFooter className="flex flex-wrap items-center justify-between gap-2">
             <p className="text-xs text-muted-foreground">
               {totalProductos} producto{totalProductos === 1 ? "" : "s"} en total
             </p>
@@ -519,7 +563,7 @@ export function InventarioView() {
             </div>
 
             <DialogFooter className="-mx-0 -mb-0 border-t-0 bg-transparent p-0 pt-2">
-              <Button type="submit" className="w-full sm:w-auto" disabled={guardandoStock}>
+              <Button type="submit" className="w-full sm:w-auto" disabled={guardandoStock || sinConexion} title={tituloSinConexion}>
                 {guardandoStock ? "Guardando..." : modoStock === "ENTRADA" ? "Agregar" : "Quitar"}
               </Button>
             </DialogFooter>
@@ -583,4 +627,17 @@ export function InventarioView() {
       </Dialog>
     </div>
   );
+}
+
+// Estado del stock de un producto: agotado, bajo o normal.
+function EstadoStock({ stock }: { stock: number }) {
+  if (stock === 0) return <Badge variant="destructive" className="text-[11px]">Sin stock</Badge>;
+  if (stock <= UMBRAL_STOCK_BAJO) {
+    return (
+      <Badge variant="outline" className="border-amber-500 text-[11px] text-amber-600 dark:text-amber-400">
+        Stock bajo
+      </Badge>
+    );
+  }
+  return <Badge variant="secondary" className="text-[11px]">OK</Badge>;
 }

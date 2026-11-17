@@ -21,3 +21,7 @@ export function aMayusculas(e: { target: HTMLInputElement }): string {
   }
   return mayus
 }
+
+// true cuando la app corre en el celular/tablet (APK de Android o iOS). Ahí no existe la ventana
+// de escritorio, así que no se muestra la barra de título propia (minimizar / maximizar / cerrar).
+export const esPlataformaMovil = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)

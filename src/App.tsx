@@ -13,6 +13,7 @@ import { ReportesView } from "@/views/reportes";
 import { ConfiguracionView } from "@/views/configuracion";
 import { ConfigurarBaseDatosView, InfoBaseDatos } from "@/views/configurar-base-datos";
 import { reiniciarVentasAbiertas } from "@/hooks/use-ventas-abiertas";
+import { AvisoSinConexion, ConexionProvider } from "@/hooks/use-conexion";
 
 const SIDEBAR_STORAGE_KEY = "sidebar-abierto";
 
@@ -104,6 +105,7 @@ export default function App() {
   }
 
   return (
+    <ConexionProvider enNube={infoDb.enNube}>
     <div className="flex h-screen w-screen flex-col overflow-hidden bg-background text-foreground">
     {/* Barra de título propia (reemplaza la de Windows) */}
     <TitleBar />
@@ -122,9 +124,9 @@ export default function App() {
 
         <main className="flex-1 flex flex-col h-full min-w-0 overflow-hidden">
           {/* Barra superior común de la aplicación de escritorio */}
-          <header className="flex h-14 items-center gap-4 border-b bg-muted/40 px-6 shrink-0">
+          <header className="flex h-14 items-center gap-3 border-b bg-muted/40 px-3 sm:gap-4 sm:px-6 shrink-0">
             <SidebarTrigger />
-            <div className="font-medium text-xs text-muted-foreground uppercase tracking-wider">
+            <div className="min-w-0 truncate font-medium text-xs text-muted-foreground uppercase tracking-wider">
               Sistema / {vistaActual}
             </div>
             <div className="ml-auto">
@@ -132,13 +134,15 @@ export default function App() {
             </div>
           </header>
 
+          <AvisoSinConexion />
+
           <div ref={mainRef} className="min-h-0 flex-1 overflow-y-auto overscroll-y-contain">
 
           {/* Área de contenido dinámico. La key fuerza a re-montar el contenedor en cada cambio de
               vista, lo que dispara una entrada suave (fundido + leve desplazamiento). */}
           <div
             key={vistaActual}
-            className="p-6 max-w-screen-2xl w-full mx-auto animate-in fade-in-0 slide-in-from-bottom-2 duration-300 ease-out motion-reduce:animate-none"
+            className="p-3 sm:p-6 max-w-screen-2xl w-full mx-auto animate-in fade-in-0 slide-in-from-bottom-2 duration-300 ease-out motion-reduce:animate-none"
           >
             {renderVista()}
           </div>
@@ -147,5 +151,6 @@ export default function App() {
       </div>
     </SidebarProvider>
     </div>
+    </ConexionProvider>
   );
 }

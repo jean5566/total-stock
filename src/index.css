@@ -135,6 +135,12 @@
   body {
     overscroll-behavior: none;
     }
+  /* Por defecto un elemento de una rejilla no se encoge por debajo del ancho de su contenido: una
+     tabla ancha estiraba toda la página más allá de la pantalla del teléfono y se cortaba. Con
+     min-width: 0 la rejilla respeta el ancho disponible y la tabla se desplaza dentro de su caja. */
+  .grid > * {
+    min-width: 0;
+    }
   body {
     @apply bg-background text-foreground;
     /* Como una app de escritorio: arrastrar con el mouse no selecciona texto de la interfaz */

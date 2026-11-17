@@ -23,7 +23,11 @@ tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 libsql = "0.10.0"
-tokio = { version = "1", features = ["sync"] }
+# Mismas versiones que usa libsql por dentro: se arma la conexión HTTPS con los certificados raíz
+# incluidos en la app (webpki-roots), porque en Android libsql no encuentra los del sistema.
+hyper = { version = "0.14", features = ["client", "tcp"] }
+hyper-rustls = { version = "0.25", default-features = false, features = ["webpki-roots", "http1"] }
+tokio = { version = "1", features = ["sync", "time"] }
 rust_xlsxwriter = "0.102.0"
 tauri-plugin-dialog = "2"
 

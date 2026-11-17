@@ -4,11 +4,15 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Cloud } from "lucide-react";
+import { FormConectarNube } from "@/components/nube-card";
 
 export interface InfoBaseDatos {
   nombre: string;
   ruta: string;
   totalProductos: number;
+  // true si los datos están en Turso y se comparten con otros dispositivos
+  enNube: boolean;
 }
 
 interface ConfigurarBaseDatosViewProps {
@@ -33,6 +37,8 @@ export function ConfigurarBaseDatosView({ onCreada }: ConfigurarBaseDatosViewPro
   const [nombre, setNombre] = useState("");
   const [error, setError] = useState("");
   const [creando, setCreando] = useState(false);
+  // true = en vez de crear una base nueva, conectarse a la que ya está en la nube
+  const [modoNube, setModoNube] = useState(false);
 
   const nombreFinal = limpiarNombre(nombre);
 
@@ -60,12 +66,19 @@ export function ConfigurarBaseDatosView({ onCreada }: ConfigurarBaseDatosViewPro
       <Card className="w-full max-w-md">
         <CardHeader className="items-center gap-2 pt-2 text-center">
           <img src="/logo.svg" alt="Total Stock" className="mx-auto mb-1 h-14 w-14" draggable={false} />
-          <CardTitle className="text-lg">Configura tu Base de Datos</CardTitle>
+          <CardTitle className="text-lg">
+            {modoNube ? "Conectar a la nube" : "Configura tu Base de Datos"}
+          </CardTitle>
           <CardDescription className="mx-auto max-w-xs">
-            Es la primera vez que abres la app. Ponle un nombre a tu base de datos para empezar.
+            {modoNube
+              ? "Pega la URL y el token de tu base en Turso para usar los mismos datos que en tus otros dispositivos."
+              : "Es la primera vez que abres la app. Ponle un nombre a tu base de datos para empezar."}
           </CardDescription>
         </CardHeader>
-        <CardContent className="pb-2">
+        <CardContent className="space-y-4 pb-2">
+          {modoNube ? (
+            <FormConectarNube textoBoton="Conectar" onConectada={onCreada} />
+          ) : (
           <form onSubmit={manejarCrear} className="space-y-5" noValidate autoComplete="off">
             <div className="space-y-2">
               <Label htmlFor="nombre-db">Nombre de la base de datos</Label>
@@ -100,6 +113,17 @@ export function ConfigurarBaseDatosView({ onCreada }: ConfigurarBaseDatosViewPro
               {creando ? "Creando..." : "Crear Base de Datos"}
             </Button>
           </form>
+          )}
+          <Button type="button" variant="ghost" className="w-full text-xs" onClick={() => setModoNube((v) => !v)}>
+            {modoNube ? (
+              "Mejor crear una base nueva en este dispositivo"
+            ) : (
+              <>
+                <Cloud className="h-4 w-4" />
+                ¿Ya tienes tus datos en la nube? Conéctate
+              </>
+            )}
+          </Button>
         </CardContent>
       </Card>
     </div>

@@ -25,6 +25,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { TablaSkeleton } from "@/components/tabla-skeleton";
+import { MENSAJE_SIN_CONEXION, useConexion } from "@/hooks/use-conexion";
 import { ClienteFormDialog, etiquetaTipoIdentificacion, type Cliente } from "@/components/cliente-form";
 
 interface PaginaClientes {
@@ -49,6 +50,8 @@ const formatoDinero = new Intl.NumberFormat("en-US", { minimumFractionDigits: 2,
 const dinero = (valor: number) => `$${formatoDinero.format(valor)}`;
 
 export function ClientesView() {
+  const { sinConexion } = useConexion();
+  const tituloSinConexion = sinConexion ? MENSAJE_SIN_CONEXION : undefined;
   const [clientes, setClientes] = useState<Cliente[]>([]);
   const [total, setTotal] = useState(0);
   const [pagina, setPagina] = useState(1);
@@ -111,6 +114,7 @@ export function ClientesView() {
   };
 
   const confirmarEliminar = async () => {
+    if (sinConexion) return;
     if (!clienteAEliminar) return;
     try {
       await invoke("eliminar_cliente", { id: clienteAEliminar.id });
@@ -140,14 +144,14 @@ export function ClientesView() {
   return (
     <div className="space-y-6">
       <div className="flex flex-wrap items-center justify-end gap-2">
-        <Button type="button" onClick={abrirNuevo}>
+        <Button type="button" onClick={abrirNuevo} disabled={sinConexion} title={tituloSinConexion}>
           <Plus className="h-4 w-4" />
           Nuevo cliente
         </Button>
       </div>
 
       <div className="flex flex-wrap items-center gap-2">
-        <div className="relative min-w-[220px] flex-1">
+        <div className="relative flex-1 min-w-full sm:min-w-[220px]">
           <Search className="absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
           <Input
             placeholder="Buscar por nombre, identificación o teléfono..."
@@ -176,7 +180,62 @@ export function ClientesView() {
               {busqueda ? "No se encontraron clientes con esa búsqueda." : "Todavía no hay clientes registrados."}
             </p>
           ) : (
-            <div className="overflow-x-auto rounded-md border">
+            <>
+            {/* Teléfono: una tarjeta por cliente (la tabla no entra en una pantalla angosta) */}
+            <ul className="divide-y rounded-md border md:hidden">
+              {clientes.map((c) => (
+                <li key={c.id} className="space-y-2 p-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="text-sm font-medium uppercase break-words">{c.nombre}</div>
+                      <div className="font-mono text-[11px] text-muted-foreground">
+                        {c.identificacion} · {etiquetaTipoIdentificacion(c.tipoIdentificacion)}
+                      </div>
+                      {c.telefono && (
+                        <div className="flex items-center gap-1 text-xs text-muted-foreground">
+                          <Phone className="h-3 w-3" aria-hidden="true" />
+                          {c.telefono}
+                        </div>
+                      )}
+                      {c.email && (
+                        <div className="flex min-w-0 items-center gap-1 text-xs text-muted-foreground">
+                          <Mail className="h-3 w-3 shrink-0" aria-hidden="true" />
+                          <span className="truncate">{c.email}</span>
+                        </div>
+                      )}
+                    </div>
+                    <div className="shrink-0 text-right">
+                      <div className="text-sm font-semibold tabular-nums">{dinero(c.totalComprado)}</div>
+                      <div className="text-[11px] text-muted-foreground">
+                        {c.compras > 0 ? `${c.compras} compra${c.compras === 1 ? "" : "s"}` : "Nuevo"}
+                      </div>
+                    </div>
+                  </div>
+                  <div className="flex justify-end gap-1">
+                    <Button type="button" variant="outline" size="sm" onClick={() => abrirHistorial(c)}>
+                      <History className="h-3.5 w-3.5" />
+                      Compras
+                    </Button>
+                    <Button type="button" variant="outline" size="sm" onClick={() => abrirEdicion(c)} disabled={sinConexion} title={tituloSinConexion}>
+                      <Pencil className="h-3.5 w-3.5" />
+                      Editar
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="icon-sm"
+                      onClick={() => setClienteAEliminar(c)}
+                      disabled={sinConexion}
+                      title={tituloSinConexion}
+                      aria-label={`Eliminar ${c.nombre}`}
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </Button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+            <div className="hidden overflow-x-auto rounded-md border md:block">
               <Table>
                 <TableHeader>
                   <TableRow>
@@ -247,6 +306,8 @@ export function ClientesView() {
                             variant="ghost"
                             size="icon-sm"
                             onClick={() => abrirEdicion(c)}
+                            disabled={sinConexion}
+                            title={tituloSinConexion}
                             aria-label={`Editar ${c.nombre}`}
                           >
                             <Pencil className="h-3.5 w-3.5" />
@@ -256,6 +317,8 @@ export function ClientesView() {
                             variant="ghost"
                             size="icon-sm"
                             onClick={() => setClienteAEliminar(c)}
+                            disabled={sinConexion}
+                            title={tituloSinConexion}
                             aria-label={`Eliminar ${c.nombre}`}
                           >
                             <Trash2 className="h-3.5 w-3.5" />
@@ -267,11 +330,12 @@ export function ClientesView() {
                 </TableBody>
               </Table>
             </div>
+            </>
           )}
         </CardContent>
 
         {total > 0 && (
-          <CardFooter className="flex items-center justify-between">
+          <CardFooter className="flex flex-wrap items-center justify-between gap-2">
             <p className="text-xs text-muted-foreground">
               {total} cliente{total === 1 ? "" : "s"} en total
             </p>
@@ -330,7 +394,7 @@ export function ClientesView() {
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>Cancelar</AlertDialogCancel>
-            <AlertDialogAction variant="destructive" onClick={confirmarEliminar}>
+            <AlertDialogAction variant="destructive" onClick={confirmarEliminar} disabled={sinConexion}>
               Eliminar
             </AlertDialogAction>
           </AlertDialogFooter>

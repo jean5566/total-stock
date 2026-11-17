@@ -12,6 +12,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { ClienteFormDialog, etiquetaTipoIdentificacion, type Cliente } from "@/components/cliente-form";
+import { MENSAJE_SIN_CONEXION, useConexion } from "@/hooks/use-conexion";
 
 interface SelectorClienteDialogProps {
   open: boolean;
@@ -24,6 +25,7 @@ interface SelectorClienteDialogProps {
 // Diálogo para elegir el cliente de una venta: búsqueda por identificación / nombre / teléfono,
 // opción "Consumidor final" y alta rápida de un cliente nuevo.
 export function SelectorClienteDialog({ open, onOpenChange, seleccionado, onElegir }: SelectorClienteDialogProps) {
+  const { sinConexion } = useConexion();
   const [busqueda, setBusqueda] = useState("");
   const [resultados, setResultados] = useState<Cliente[]>([]);
   const [buscando, setBuscando] = useState(false);
@@ -117,7 +119,13 @@ export function SelectorClienteDialog({ open, onOpenChange, seleccionado, onEleg
             )}
           </div>
 
-          <Button type="button" variant="outline" onClick={() => setFormAbierto(true)}>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => setFormAbierto(true)}
+            disabled={sinConexion}
+            title={sinConexion ? MENSAJE_SIN_CONEXION : undefined}
+          >
             <Plus className="h-4 w-4" />
             Nuevo cliente{busqueda.trim() ? ` "${busqueda.trim()}"` : ""}
           </Button>

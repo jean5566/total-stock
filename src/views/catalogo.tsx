@@ -10,6 +10,7 @@ import { TablaSkeleton } from "@/components/tabla-skeleton";
 import { AltoAnimado } from "@/components/alto-animado";
 import { AplicacionTexto, MedidaTag } from "@/components/medida-tag";
 import { placeholderBusqueda, useAjustes } from "@/hooks/use-ajustes";
+import { MENSAJE_SIN_CONEXION, useConexion } from "@/hooks/use-conexion";
 import { Card, CardContent, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -77,6 +78,9 @@ interface ErroresFormulario {
 }
 
 export function CatalogoView() {
+  const { sinConexion } = useConexion();
+  // Sin internet no se puede guardar en la nube: los botones de cambios quedan desactivados
+  const tituloSinConexion = sinConexion ? MENSAJE_SIN_CONEXION : undefined;
   const [dialogAbierto, setDialogAbierto] = useState(false);
   const [dialogCategoriasAbierto, setDialogCategoriasAbierto] = useState(false);
 
@@ -242,6 +246,7 @@ export function CatalogoView() {
   };
 
   const agregarCategoria = async () => {
+    if (sinConexion) return;
     const valor = nuevaCategoria.trim().toUpperCase();
     if (!valor) {
       setErrorCategoria("Escribe un nombre de categoría.");
@@ -276,6 +281,7 @@ export function CatalogoView() {
   };
 
   const renombrarCategoria = async () => {
+    if (sinConexion) return;
     if (!categoriaEditando) return;
     const actual = categoriaEditando;
     const nuevo = textoCategoriaEditada.trim().toUpperCase();
@@ -313,6 +319,7 @@ export function CatalogoView() {
   };
 
   const eliminarCategoria = async (valor: string) => {
+    if (sinConexion) return;
     try {
       const lista: string[] = await invoke("eliminar_categoria", { nombre: valor });
       setCategorias(lista);
@@ -325,6 +332,7 @@ export function CatalogoView() {
 
   const manejarGuardar = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (sinConexion) return;
     if (!validarFormulario()) return;
 
     const datos = {
@@ -363,6 +371,7 @@ export function CatalogoView() {
   };
 
   const manejarEliminar = async () => {
+    if (sinConexion) return;
     if (!productoAEliminar) return;
 
     try {
@@ -383,7 +392,7 @@ export function CatalogoView() {
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-end">
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center justify-end gap-2">
           <Dialog
             open={dialogCategoriasAbierto}
             onOpenChange={(open) => {
@@ -396,7 +405,7 @@ export function CatalogoView() {
               }
             }}
           >
-            <DialogTrigger render={<Button variant="outline" />}>
+            <DialogTrigger render={<Button variant="outline" disabled={sinConexion} title={tituloSinConexion} />}>
               <Tag className="h-4 w-4" />
               Gestionar Categorías
             </DialogTrigger>
@@ -443,6 +452,7 @@ export function CatalogoView() {
                           type="button"
                           size="icon-sm"
                           onClick={renombrarCategoria}
+                          disabled={sinConexion}
                           aria-label="Guardar nombre"
                         >
                           <Check className="h-3.5 w-3.5" />
@@ -463,7 +473,8 @@ export function CatalogoView() {
                       <button
                         type="button"
                         onClick={() => iniciarRenombrado(cat)}
-                        className="ml-1 rounded-full p-0.5 hover:bg-foreground/10"
+                        disabled={sinConexion}
+                        className="ml-1 rounded-full p-0.5 hover:bg-foreground/10 disabled:pointer-events-none disabled:opacity-50"
                         aria-label={`Renombrar categoría ${cat}`}
                       >
                         <Pencil className="h-3 w-3" />
@@ -471,7 +482,8 @@ export function CatalogoView() {
                       <button
                         type="button"
                         onClick={() => eliminarCategoria(cat)}
-                        className="ml-1 rounded-full p-0.5 hover:bg-foreground/10"
+                        disabled={sinConexion}
+                        className="ml-1 rounded-full p-0.5 hover:bg-foreground/10 disabled:pointer-events-none disabled:opacity-50"
                         aria-label={`Eliminar categoría ${cat}`}
                       >
                         <X className="h-3 w-3" />
@@ -501,7 +513,7 @@ export function CatalogoView() {
                     className="uppercase"
                     aria-invalid={Boolean(errorCategoria)}
                   />
-                  <Button type="button" onClick={agregarCategoria}>
+                  <Button type="button" onClick={agregarCategoria} disabled={sinConexion}>
                     <Plus className="h-4 w-4" />
                     Agregar
                   </Button>
@@ -518,7 +530,7 @@ export function CatalogoView() {
               if (!open) limpiarFormulario();
             }}
           >
-            <DialogTrigger render={<Button />}>
+            <DialogTrigger render={<Button disabled={sinConexion} title={tituloSinConexion} />}>
               <Plus className="h-4 w-4" />
               Agregar Producto
             </DialogTrigger>
@@ -661,7 +673,7 @@ export function CatalogoView() {
                 </div>
 
                 <DialogFooter className="-mx-0 -mb-0 border-t-0 bg-transparent p-0 pt-2">
-                  <Button type="submit" className="w-full sm:w-auto">
+                  <Button type="submit" className="w-full sm:w-auto" disabled={sinConexion} title={tituloSinConexion}>
                     {productoEditando ? "Actualizar Producto" : "Guardar Producto"}
                   </Button>
                 </DialogFooter>
@@ -673,7 +685,7 @@ export function CatalogoView() {
 
       {/* Búsqueda y filtro por categoría */}
       <div className="flex flex-wrap items-center gap-2">
-        <div className="relative flex-1 min-w-[220px]">
+        <div className="relative flex-1 min-w-full sm:min-w-[220px]">
           <Search className="absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
           <Input
             placeholder={placeholderBusqueda(ajustes)}
@@ -683,7 +695,7 @@ export function CatalogoView() {
           />
         </div>
         <Select value={categoriaFiltro} onValueChange={(val) => setCategoriaFiltro(val ?? TODAS_CATEGORIAS)}>
-          <SelectTrigger className="w-[200px]">
+          <SelectTrigger className="flex-1 sm:w-[200px] sm:flex-none">
             <SelectValue placeholder="Categoría" />
           </SelectTrigger>
           <SelectContent>
@@ -725,7 +737,53 @@ export function CatalogoView() {
                 : "No hay productos registrados."}
             </p>
           ) : (
-            <div className="border rounded-md overflow-x-auto">
+            <>
+            {/* Teléfono: una tarjeta por producto (la tabla no entra en una pantalla angosta) */}
+            <ul className="divide-y rounded-md border md:hidden">
+              {productos.map((prod) => (
+                <li key={prod.id} className="space-y-2 p-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0 uppercase">
+                      <div className="text-sm font-medium break-words">
+                        {prod.detalle}
+                        {usarMedida && prod.medida && <MedidaTag medida={prod.medida} />}
+                      </div>
+                      <div className="font-mono text-[11px] text-muted-foreground">
+                        {prod.codigo} · {prod.categoria}
+                      </div>
+                      {usarAplicacion && prod.aplicacion && <AplicacionTexto aplicacion={prod.aplicacion} />}
+                    </div>
+                    <div className="shrink-0 text-right">
+                      <div className="text-sm font-semibold tabular-nums">${prod.precio.toFixed(2)}</div>
+                      <div className="text-xs text-muted-foreground">{prod.stock} u.</div>
+                    </div>
+                  </div>
+                  <div className="flex items-center justify-between gap-2">
+                    <Badge variant={prod.iva === "SIN_IVA" ? "outline" : "secondary"} className="text-[11px]">
+                      {etiquetaIva(prod.iva)}
+                    </Badge>
+                    <div className="flex gap-1">
+                      <Button type="button" variant="outline" size="sm" onClick={() => abrirEdicion(prod)} disabled={sinConexion} title={tituloSinConexion}>
+                        <Pencil className="h-3.5 w-3.5" />
+                        Editar
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="icon-sm"
+                        onClick={() => setProductoAEliminar(prod)}
+                        disabled={sinConexion}
+                        title={tituloSinConexion}
+                        aria-label={`Eliminar ${prod.detalle}`}
+                      >
+                        <Trash2 className="h-3.5 w-3.5 text-destructive" />
+                      </Button>
+                    </div>
+                  </div>
+                </li>
+              ))}
+            </ul>
+            <div className="hidden overflow-x-auto rounded-md border md:block">
               <Table>
                 <TableHeader>
                   <TableRow>
@@ -762,6 +820,8 @@ export function CatalogoView() {
                             variant="ghost"
                             size="icon-sm"
                             onClick={() => abrirEdicion(prod)}
+                            disabled={sinConexion}
+                            title={tituloSinConexion}
                             aria-label={`Editar ${prod.detalle}`}
                           >
                             <Pencil className="h-3.5 w-3.5" />
@@ -771,6 +831,8 @@ export function CatalogoView() {
                             variant="ghost"
                             size="icon-sm"
                             onClick={() => setProductoAEliminar(prod)}
+                            disabled={sinConexion}
+                            title={tituloSinConexion}
                             aria-label={`Eliminar ${prod.detalle}`}
                           >
                             <Trash2 className="h-3.5 w-3.5 text-destructive" />
@@ -782,13 +844,14 @@ export function CatalogoView() {
                 </TableBody>
               </Table>
             </div>
+            </>
           )}
           </div>
           </AltoAnimado>
         </CardContent>
 
         {totalProductos > 0 && (
-          <CardFooter className="flex items-center justify-between">
+          <CardFooter className="flex flex-wrap items-center justify-between gap-2">
             <p className="text-xs text-muted-foreground">
               {totalProductos} producto{totalProductos === 1 ? "" : "s"} en total
             </p>
@@ -839,6 +902,7 @@ export function CatalogoView() {
             <AlertDialogCancel>Cancelar</AlertDialogCancel>
             <AlertDialogAction
               onClick={manejarEliminar}
+              disabled={sinConexion}
               className="bg-destructive text-white hover:bg-destructive/90 focus-visible:ring-destructive/30"
             >
               Eliminar

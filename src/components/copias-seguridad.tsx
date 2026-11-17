@@ -15,6 +15,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import type { InfoBaseDatos } from "@/views/configurar-base-datos";
+import { MENSAJE_SIN_CONEXION, useConexion } from "@/hooks/use-conexion";
 
 // Debe coincidir con el struct CopiaSeguridad en src-tauri/src/lib.rs
 interface CopiaSeguridad {
@@ -42,6 +43,8 @@ interface CopiasSeguridadCardProps {
 }
 
 export function CopiasSeguridadCard({ onRestaurada }: CopiasSeguridadCardProps) {
+  // Restaurar escribe en la nube; crear o borrar copias es local y funciona sin internet
+  const { sinConexion } = useConexion();
   const [copias, setCopias] = useState<CopiaSeguridad[]>([]);
   const [ocupado, setOcupado] = useState(false);
   const [mensaje, setMensaje] = useState("");
@@ -83,6 +86,7 @@ export function CopiasSeguridadCard({ onRestaurada }: CopiasSeguridadCardProps) 
 
   const restaurar = (copia: CopiaSeguridad) =>
     ejecutar(async () => {
+      if (sinConexion) throw MENSAJE_SIN_CONEXION;
       const info = await invoke<InfoBaseDatos>("restaurar_copia_seguridad", { archivo: copia.archivo });
       // La restauración guarda antes una copia automática del estado anterior
       setCopias(await invoke<CopiaSeguridad[]>("obtener_copias_seguridad"));
@@ -139,7 +143,8 @@ export function CopiasSeguridadCard({ onRestaurada }: CopiasSeguridadCardProps) 
                     variant="outline"
                     size="sm"
                     onClick={() => setARestaurar(copia)}
-                    disabled={ocupado}
+                    disabled={ocupado || sinConexion}
+                    title={sinConexion ? MENSAJE_SIN_CONEXION : undefined}
                   >
                     <RotateCcw className="h-3.5 w-3.5" />
                     Restaurar

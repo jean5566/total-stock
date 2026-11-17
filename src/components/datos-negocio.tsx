@@ -6,6 +6,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { aMayusculas } from "@/lib/utils";
+import { MENSAJE_SIN_CONEXION, useConexion } from "@/hooks/use-conexion";
 
 // Debe coincidir con el struct DatosNegocio en src-tauri/src/lib.rs
 export interface DatosNegocio {
@@ -38,6 +39,7 @@ function validar(d: DatosNegocio): Errores {
 }
 
 export function DatosNegocioCard() {
+  const { sinConexion } = useConexion();
   const [datos, setDatos] = useState<DatosNegocio>(VACIO);
   // Últimos datos guardados, para saber si hay cambios pendientes
   const [guardados, setGuardados] = useState<DatosNegocio>(VACIO);
@@ -67,6 +69,7 @@ export function DatosNegocioCard() {
 
   const guardar = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (sinConexion) return;
     const nuevosErrores = validar(datos);
     setErrores(nuevosErrores);
     if (Object.keys(nuevosErrores).length > 0) return;
@@ -145,7 +148,12 @@ export function DatosNegocioCard() {
                 Guardado
               </span>
             )}
-            <Button type="submit" size="sm" disabled={!cargado || guardando || !hayCambios}>
+            <Button
+              type="submit"
+              size="sm"
+              disabled={!cargado || guardando || !hayCambios || sinConexion}
+              title={sinConexion ? MENSAJE_SIN_CONEXION : undefined}
+            >
               {guardando ? "Guardando..." : "Guardar datos"}
             </Button>
           </div>

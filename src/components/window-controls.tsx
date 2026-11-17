@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Copy, Minus, Square, X } from "lucide-react";
-import { cn } from "@/lib/utils";
+import { cn, esPlataformaMovil } from "@/lib/utils";
 import { guardarVentasAbiertasAhora } from "@/hooks/use-ventas-abiertas";
 
 // Botones de minimizar / maximizar / cerrar propios. La ventana no tiene la barra de título de
@@ -71,7 +71,9 @@ export function WindowControls({ className }: { className?: string }) {
 }
 
 // Barra de título propia: se arrastra para mover la ventana y con doble clic se maximiza.
+// En el celular no hay ventana que mover ni minimizar, así que no se muestra.
 export function TitleBar({ className }: { className?: string }) {
+  if (esPlataformaMovil) return null;
   return (
     <div
       data-tauri-drag-region

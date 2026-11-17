@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Minus, Plus } from "lucide-react";
 import { aMayusculas } from "@/lib/utils";
+import { MENSAJE_SIN_CONEXION, useConexion } from "@/hooks/use-conexion";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -106,6 +107,7 @@ interface Props {
 }
 
 export function DevolucionDialog({ open, onOpenChange, ventaId, lineas, devolucionesPrevias, onRegistrada }: Props) {
+  const { sinConexion } = useConexion();
   const [seleccion, setSeleccion] = useState<Record<number, Seleccion>>({});
   const [motivo, setMotivo] = useState("");
   const [reembolso, setReembolso] = useState<Reembolso>("EFECTIVO");
@@ -147,6 +149,7 @@ export function DevolucionDialog({ open, onOpenChange, ventaId, lineas, devoluci
   };
 
   const registrar = async (cambiarAhora: boolean) => {
+    if (sinConexion) return;
     setError("");
     if (unidades === 0) {
       setError("Elige al menos un producto a devolver.");
@@ -207,8 +210,8 @@ export function DevolucionDialog({ open, onOpenChange, ventaId, lineas, devoluci
                   const sel = seleccion[l.id] ?? { cantidad: 0, regresaStock: true };
                   return (
                     <TableRow key={l.id} className={max === 0 ? "opacity-50" : ""}>
-                      <TableCell className="text-sm uppercase">
-                        <div className="font-medium">{l.detalle}</div>
+                      <TableCell className="min-w-32 text-sm whitespace-normal uppercase">
+                        <div className="font-medium break-words">{l.detalle}</div>
                         <div className="font-mono text-[11px] text-muted-foreground">{l.codigo}</div>
                       </TableCell>
                       <TableCell className="text-right text-sm">
@@ -341,15 +344,15 @@ export function DevolucionDialog({ open, onOpenChange, ventaId, lineas, devoluci
           </Button>
           {reembolso === "CAMBIO" ? (
             <>
-              <Button type="button" variant="outline" disabled={guardando || unidades === 0} onClick={() => registrar(false)}>
+              <Button type="button" variant="outline" disabled={sinConexion || guardando || unidades === 0} title={sinConexion ? MENSAJE_SIN_CONEXION : undefined} onClick={() => registrar(false)}>
                 Solo registrar crédito
               </Button>
-              <Button type="button" disabled={guardando || unidades === 0} onClick={() => registrar(true)}>
+              <Button type="button" disabled={sinConexion || guardando || unidades === 0} title={sinConexion ? MENSAJE_SIN_CONEXION : undefined} onClick={() => registrar(true)}>
                 {guardando ? "Registrando..." : `Registrar y elegir producto nuevo (${formatear(calc.total)})`}
               </Button>
             </>
           ) : (
-            <Button type="button" disabled={guardando || unidades === 0} onClick={() => registrar(false)}>
+            <Button type="button" disabled={sinConexion || guardando || unidades === 0} title={sinConexion ? MENSAJE_SIN_CONEXION : undefined} onClick={() => registrar(false)}>
               {guardando ? "Registrando..." : `Registrar devolución ${formatear(calc.total)}`}
             </Button>
           )}

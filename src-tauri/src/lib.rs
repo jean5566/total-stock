@@ -1,7 +1,9 @@
 mod db;
+mod nube;
 mod reportes;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use db::{con_nombre, es_duplicado, fila, filas, una_fila, FilaExt};
 use libsql::{params, Connection, Row, Value};
@@ -63,28 +65,84 @@ struct InfoBaseDatos {
     nombre: String,
     ruta: String,
     total_productos: i64,
+    // true si los datos están en Turso y se comparten con otros dispositivos
+    en_nube: bool,
 }
 
 // Base de datos abierta: libsql necesita conservar `Database` mientras se use la conexión.
 // La ruta se guarda aparte porque libsql no la expone (se usa para copias y para borrar el archivo).
 struct BaseActiva {
-    _db: libsql::Database,
+    db: libsql::Database,
     conn: Connection,
     ruta: PathBuf,
+    // true = copia local de la base en Turso (ver nube.rs); false = archivo SQLite solo de este equipo
+    nube: bool,
 }
 
 // La base es None hasta que el usuario crea la base de datos en el primer inicio.
 // Es un Mutex de tokio porque se mantiene tomado durante las consultas (que son async): así los
 // comandos se ejecutan de a uno, como antes, y una transacción no se mezcla con otro comando.
+// Va en un Arc para que el hilo que abre la base al iniciar pueda tener el candado tomado mientras
+// tanto (ver run).
 struct AppState {
-    db: Mutex<Option<BaseActiva>>,
+    db: Arc<Mutex<Option<BaseActiva>>>,
 }
 
 async fn abrir_base_de_datos(ruta: PathBuf) -> libsql::Result<BaseActiva> {
     let db = libsql::Builder::new_local(&ruta).build().await?;
     let conn = db.connect()?;
     crear_esquema(&conn).await?;
-    Ok(BaseActiva { _db: db, conn, ruta })
+    Ok(BaseActiva { db, conn, ruta, nube: false })
+}
+
+// Cada cuánto se traen solos los cambios hechos en el otro dispositivo.
+const INTERVALO_SINCRONIZACION: std::time::Duration = std::time::Duration::from_secs(20);
+// Tiempo máximo esperando a Turso al abrir: sin internet la app abre igual con la copia local.
+const ESPERA_MAXIMA_NUBE: std::time::Duration = std::time::Duration::from_secs(15);
+
+// Abre la copia local de la base en Turso y la pone al día. Sin internet funciona con lo que ya
+// se había descargado; solo falla si nunca se descargó nada.
+async fn abrir_base_nube(dir: &std::path::Path, config: &nube::ConfigNube) -> Result<BaseActiva, String> {
+    let ruta = nube::ruta_replica(dir, &config.url);
+    if let Some(carpeta) = ruta.parent() {
+        std::fs::create_dir_all(carpeta).map_err(|e| e.to_string())?;
+    }
+    let ya_existia = ruta.exists();
+
+    // new_remote_replica no sirve aquí: su build() consulta a Turso qué protocolo usar y sin
+    // internet falla antes de abrir la copia local. Con Turso siempre elige este (protocolo v2,
+    // escrituras enviadas a la nube), así que se crea directo y abre sin red.
+    let db = libsql::Builder::new_synced_database(&ruta, config.url.clone(), config.token.clone())
+        .connector(nube::conector_https())
+        .remote_writes(true)
+        .read_your_writes(true)
+        .sync_interval(INTERVALO_SINCRONIZACION)
+        .build()
+        .await
+        .map_err(nube::mensaje_error)?;
+
+    let sincronizada = match tokio::time::timeout(ESPERA_MAXIMA_NUBE, db.sync()).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(nube::mensaje_error(e)),
+        Err(_) => Err("La nube tardó demasiado en responder. Revisa tu conexión a internet.".to_string()),
+    };
+    if let Err(e) = sincronizada {
+        if !ya_existia {
+            drop(db);
+            nube::borrar_replica(&ruta);
+            return Err(e);
+        }
+        eprintln!("Sin sincronizar, se usa la copia local: {}", e);
+    }
+
+    let conn = db.connect().map_err(nube::mensaje_error)?;
+    if !esquema_al_dia(&conn).await {
+        // Sin internet no se puede actualizar el esquema; se sigue con el que hay
+        if let Err(e) = crear_esquema(&conn).await {
+            eprintln!("No se pudo actualizar el esquema en la nube: {}", e);
+        }
+    }
+    Ok(BaseActiva { db, conn, ruta, nube: true })
 }
 
 async fn crear_esquema(conn: &Connection) -> libsql::Result<()> {
@@ -274,7 +332,29 @@ async fn crear_esquema(conn: &Connection) -> libsql::Result<()> {
     )
     .await?;
 
+    conn.execute(
+        "INSERT INTO configuracion (clave, valor) VALUES ('esquema_version', ?1)
+         ON CONFLICT(clave) DO UPDATE SET valor = excluded.valor",
+        params![VERSION_ESQUEMA],
+    )
+    .await?;
+
     Ok(())
+}
+
+// Con la nube, cada sentencia de crear_esquema viaja a Turso (es lenta y necesita internet), así que
+// al abrir solo se ejecuta si la copia local tiene otra versión. SÚBELA cada vez que cambies
+// crear_esquema (tablas, columnas o índices nuevos).
+const VERSION_ESQUEMA: &str = "1";
+
+async fn esquema_al_dia(conn: &Connection) -> bool {
+    matches!(
+        una_fila(conn, "SELECT valor FROM configuracion WHERE clave = 'esquema_version'", (), |row| {
+            row.col::<String>(0)
+        })
+        .await,
+        Ok(Some(v)) if v == VERSION_ESQUEMA
+    )
 }
 
 // Agrega una columna a una tabla existente solo si todavía no existe (migración simple).
@@ -365,6 +445,7 @@ async fn info_de_conexion(base: &BaseActiva) -> libsql::Result<InfoBaseDatos> {
         nombre,
         ruta: base.ruta.to_string_lossy().to_string(),
         total_productos,
+        en_nube: base.nube,
     })
 }
 
@@ -461,18 +542,32 @@ const CLAVE_VENTAS_ABIERTAS: &str = "ventas_abiertas";
 const MAX_BYTES_VENTAS_ABIERTAS: usize = 512 * 1024;
 
 #[tauri::command]
-async fn obtener_ventas_abiertas(state: tauri::State<'_, AppState>) -> Result<String, String> {
+async fn obtener_ventas_abiertas(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
     let guard = state.db.lock().await;
+    // Con la nube, cada dispositivo tiene sus propias ventas en curso (en un archivo local)
+    if guard.as_ref().is_some_and(|b| b.nube) {
+        return Ok(nube::leer_ventas_abiertas(&directorio_datos(&app)?));
+    }
     let conn = requerir_conexion(&guard)?;
     leer_ajuste_texto(conn, CLAVE_VENTAS_ABIERTAS).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn guardar_ventas_abiertas(state: tauri::State<'_, AppState>, datos: String) -> Result<(), String> {
+async fn guardar_ventas_abiertas(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    datos: String,
+) -> Result<(), String> {
     if datos.len() > MAX_BYTES_VENTAS_ABIERTAS {
         return Err("Hay demasiadas ventas abiertas para guardarlas.".to_string());
     }
     let guard = state.db.lock().await;
+    if guard.as_ref().is_some_and(|b| b.nube) {
+        return nube::guardar_ventas_abiertas(&directorio_datos(&app)?, &datos);
+    }
     let conn = requerir_conexion(&guard)?;
     conn.execute(
         "INSERT INTO configuracion (clave, valor) VALUES (?1, ?2)
@@ -793,8 +888,14 @@ const PALABRA_CONFIRMACION: &str = "CONFIRMAR";
 // Borra por completo la base de datos (productos, inventario, ventas, clientes y ajustes).
 // Cierra la conexión, elimina el archivo .db y sus archivos auxiliares de SQLite, y deja la app
 // sin base configurada para que se cree una nueva desde la pantalla de primer inicio.
+// Con la nube solo desconecta este dispositivo: borra la copia local y la conexión guardada, pero
+// los datos en Turso (y en los otros dispositivos) quedan intactos.
 #[tauri::command]
-async fn eliminar_base_de_datos(state: tauri::State<'_, AppState>, confirmacion: String) -> Result<(), String> {
+async fn eliminar_base_de_datos(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    confirmacion: String,
+) -> Result<(), String> {
     if confirmacion.trim() != PALABRA_CONFIRMACION {
         return Err(format!("Escribe {} para eliminar la base de datos.", PALABRA_CONFIRMACION));
     }
@@ -803,6 +904,11 @@ async fn eliminar_base_de_datos(state: tauri::State<'_, AppState>, confirmacion:
     let base = guard
         .take()
         .ok_or_else(|| "La base de datos no está configurada.".to_string())?;
+    if base.nube {
+        drop(base);
+        nube::olvidar(&directorio_datos(&app)?);
+        return Ok(());
+    }
     let ruta = base.ruta.clone();
 
     // En Windows el archivo no se puede borrar mientras la conexión esté abierta: al soltar
@@ -851,6 +957,117 @@ async fn crear_base_de_datos(
     info
 }
 
+fn directorio_datos(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Nube (Turso): la misma base en la laptop y en el teléfono
+// ---------------------------------------------------------------------------------------------
+
+// Conecta este dispositivo a una base de Turso.
+// - Si aquí hay una base local con datos y la de Turso está vacía, primero sube todos los datos
+//   (y deja una copia de seguridad del archivo local, por si acaso).
+// - Si Turso ya tiene datos (p. ej. los subió la laptop), este dispositivo solo los descarga.
+// - Si ambos tienen datos no hace nada, para no mezclar ni perder información.
+#[tauri::command]
+async fn conectar_nube(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    url: String,
+    token: String,
+) -> Result<InfoBaseDatos, String> {
+    let config = nube::ConfigNube {
+        url: nube::normalizar_url(&url)?,
+        token: token.trim().to_string(),
+    };
+    if config.token.is_empty() || config.token.contains(char::is_whitespace) {
+        return Err("Pega el token completo que te dio Turso.".to_string());
+    }
+    let dir = directorio_datos(&app)?;
+
+    let mut guard = state.db.lock().await;
+    if guard.as_ref().is_some_and(|b| b.nube) {
+        return Err("Este dispositivo ya está conectado a la nube.".to_string());
+    }
+
+    // Conexión directa a Turso: comprueba la URL y el token, y prepara las tablas.
+    let remota_db = libsql::Builder::new_remote(config.url.clone(), config.token.clone())
+        .connector(nube::conector_https())
+        .build()
+        .await
+        .map_err(nube::mensaje_error)?;
+    let remota = remota_db.connect().map_err(nube::mensaje_error)?;
+    crear_esquema(&remota).await.map_err(nube::mensaje_error)?;
+    let nube_con_datos = nube::tiene_datos(&remota).await.map_err(nube::mensaje_error)?;
+
+    if let Some(local) = guard.as_ref() {
+        let local_con_datos = nube::tiene_datos(&local.conn).await.map_err(|e| e.to_string())?;
+        if local_con_datos && nube_con_datos {
+            return Err("La base de Turso ya tiene datos y este dispositivo también. Para no mezclarlos \
+                        no se conectó: usa una base vacía en Turso, o elimina la base de este \
+                        dispositivo y vuelve a conectar para descargar la de la nube."
+                .to_string());
+        }
+        // Copia de seguridad del archivo local antes de dejarlo
+        crear_copia(local, &directorio_copias(&app)?, "antes-de-nube").await?;
+        if local_con_datos {
+            let tx = remota.transaction().await.map_err(nube::mensaje_error)?;
+            nube::copiar_datos(&local.conn, &tx).await.map_err(nube::mensaje_error)?;
+            tx.commit().await.map_err(nube::mensaje_error)?;
+        }
+        // Las ventas en curso pasan al archivo de este dispositivo
+        let abiertas = leer_ajuste_texto(&local.conn, CLAVE_VENTAS_ABIERTAS).await.unwrap_or_default();
+        nube::guardar_ventas_abiertas(&dir, &abiertas)?;
+    }
+    drop(remota);
+    drop(remota_db);
+
+    let base = abrir_base_nube(&dir, &config).await?;
+    nube::guardar_config(&dir, &config)?;
+
+    // La base local ya está en la nube (y en copias): se quita para que no se vuelva a abrir.
+    if let Some(local) = guard.take() {
+        let ruta = local.ruta.clone();
+        drop(local);
+        for sufijo in ["", "-wal", "-shm", "-journal"] {
+            let _ = std::fs::remove_file(format!("{}{}", ruta.display(), sufijo));
+        }
+    }
+
+    *guard = Some(base);
+    let base = guard.as_ref().expect("recién guardada");
+    info_de_conexion(base).await.map_err(|e| e.to_string())
+}
+
+// Trae ahora los cambios hechos en los otros dispositivos (además de la sincronización automática).
+#[tauri::command]
+async fn sincronizar_nube(state: tauri::State<'_, AppState>) -> Result<InfoBaseDatos, String> {
+    let guard = state.db.lock().await;
+    let base = guard
+        .as_ref()
+        .filter(|b| b.nube)
+        .ok_or_else(|| "Este dispositivo no está conectado a la nube.".to_string())?;
+    match tokio::time::timeout(ESPERA_MAXIMA_NUBE, base.db.sync()).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => return Err(nube::mensaje_error(e)),
+        Err(_) => return Err("La nube tardó demasiado en responder. Revisa tu conexión a internet.".to_string()),
+    }
+    info_de_conexion(base).await.map_err(|e| e.to_string())
+}
+
+// true si Turso responde. No toma el candado de la base: así funciona aunque haya un comando
+// esperando a la nube. Sin conexión a la nube configurada siempre es true (la base es local).
+#[tauri::command]
+async fn comprobar_conexion_nube(app: tauri::AppHandle) -> Result<bool, String> {
+    match nube::leer_config(&directorio_datos(&app)?) {
+        Some(config) => Ok(nube::hay_conexion(&config).await),
+        None => Ok(true),
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Copias de seguridad
 // ---------------------------------------------------------------------------------------------
@@ -883,7 +1100,10 @@ fn directorio_copias(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 
 // Crea una copia consistente de la base con VACUUM INTO (funciona con la conexión abierta).
 // El nombre empieza con la fecha para que se ordenen solas: "2026-11-07_15-30-00_manual.db".
-async fn crear_copia(conn: &Connection, dir: &std::path::Path, tipo: &str) -> Result<PathBuf, String> {
+// Con la nube, VACUUM INTO se enviaría a Turso (no lo permite): la copia se arma creando una base
+// local nueva y copiándole las filas desde la copia local de la nube.
+async fn crear_copia(base: &BaseActiva, dir: &std::path::Path, tipo: &str) -> Result<PathBuf, String> {
+    let conn = &base.conn;
     let fecha: String = fila(conn, "SELECT strftime('%Y-%m-%d_%H-%M-%S', 'now', 'localtime')", (), |row| row.col(0))
         .await
         .map_err(|e| e.to_string())?;
@@ -893,6 +1113,22 @@ async fn crear_copia(conn: &Connection, dir: &std::path::Path, tipo: &str) -> Re
     while destino.exists() {
         destino = dir.join(format!("{}_{}-{}.db", fecha, tipo, n));
         n += 1;
+    }
+    if base.nube {
+        let resultado = async {
+            let copia = libsql::Builder::new_local(&destino).build().await?;
+            let destino_conn = copia.connect()?;
+            crear_esquema(&destino_conn).await?;
+            let tx = destino_conn.transaction().await?;
+            nube::copiar_datos(conn, &tx).await?;
+            tx.commit().await
+        }
+        .await;
+        if let Err(e) = resultado {
+            let _ = std::fs::remove_file(&destino);
+            return Err(format!("No se pudo crear la copia de seguridad: {}", e));
+        }
+        return Ok(destino);
     }
     conn.execute("VACUUM INTO ?1", params![destino.to_string_lossy().to_string()])
         .await
@@ -975,8 +1211,8 @@ mod pruebas_copias {
         std::fs::create_dir_all(&dir).unwrap();
 
         let base = abrir_base_de_datos(dir.join("base.db")).await.unwrap();
-        let copia = crear_copia(&base.conn, &dir, "manual").await.unwrap();
-        crear_copia(&base.conn, &dir, "antes-de-restaurar").await.unwrap();
+        let copia = crear_copia(&base, &dir, "manual").await.unwrap();
+        crear_copia(&base, &dir, "antes-de-restaurar").await.unwrap();
 
         // La copia es una base válida con la tabla de productos; un archivo cualquiera no lo es.
         assert!(es_copia_valida(&copia).await);
@@ -1015,8 +1251,10 @@ async fn crear_copia_seguridad(
 ) -> Result<Vec<CopiaSeguridad>, String> {
     let dir = directorio_copias(&app)?;
     let guard = state.db.lock().await;
-    let conn = requerir_conexion(&guard)?;
-    crear_copia(conn, &dir, "manual").await?;
+    let base = guard
+        .as_ref()
+        .ok_or_else(|| "La base de datos no está configurada.".to_string())?;
+    crear_copia(base, &dir, "manual").await?;
     listar_copias(&dir)
 }
 
@@ -1045,12 +1283,32 @@ async fn restaurar_copia_seguridad(
     }
 
     let mut guard = state.db.lock().await;
+
+    // Con la nube no se reemplaza el archivo (es solo la copia local): se vacían las tablas en Turso
+    // y se cargan las filas de la copia, todo en una transacción (si falla, no cambia nada).
+    if let Some(base) = guard.as_ref().filter(|b| b.nube) {
+        crear_copia(base, &dir, "antes-de-restaurar").await?;
+        let resultado = async {
+            let copia = libsql::Builder::new_local(&origen).build().await?;
+            let copia_conn = copia.connect()?;
+            // Una copia vieja puede no tener las columnas nuevas
+            crear_esquema(&copia_conn).await?;
+            let tx = base.conn.transaction().await?;
+            nube::vaciar(&tx).await?;
+            nube::copiar_datos(&copia_conn, &tx).await?;
+            tx.commit().await
+        }
+        .await;
+        resultado.map_err(nube::mensaje_error)?;
+        return info_de_conexion(base).await.map_err(|e| e.to_string());
+    }
+
     let base = guard
         .take()
         .ok_or_else(|| "La base de datos no está configurada.".to_string())?;
     let ruta_actual = base.ruta.clone();
 
-    let respaldo = match crear_copia(&base.conn, &dir, "antes-de-restaurar").await {
+    let respaldo = match crear_copia(&base, &dir, "antes-de-restaurar").await {
         Ok(r) => r,
         Err(e) => {
             *guard = Some(base);
@@ -2861,16 +3119,52 @@ pub fn run() {
                 .expect("no se pudo obtener el directorio de datos de la app");
             std::fs::create_dir_all(&dir).expect("no se pudo crear el directorio de datos de la app");
 
-            // Si ya existe una base de datos (de un inicio anterior) la abrimos; si no, queda sin
-            // configurar hasta que el usuario le ponga nombre desde la pantalla de primer inicio.
-            let base = buscar_base_existente(&dir).map(|ruta| {
-                tauri::async_runtime::block_on(abrir_base_de_datos(ruta))
-                    .expect("no se pudo abrir la base de datos SQLite")
-            });
+            // Si el dispositivo está conectado a la nube se abre esa base; si no, la base local de
+            // un inicio anterior. Si no hay ninguna, queda sin configurar hasta que el usuario cree
+            // una o se conecte desde la pantalla de primer inicio.
+            //
+            // Con la nube abrir tarda unos segundos (sincroniza con Turso) y la pantalla ya está
+            // cargando: si preguntara por la base antes de tiempo, creería que no hay ninguna y
+            // mostraría el formulario de primer inicio. Por eso el estado se registra ya, con el
+            // candado tomado por el hilo que abre la base: los comandos esperan a que termine.
+            //
+            // Se abre en un hilo aparte con más pila: el hilo principal de Windows tiene solo 1 MB y
+            // abrir la base de la nube (libsql) lo desborda en modo desarrollo (STACK_OVERFLOW).
+            let db = Arc::new(Mutex::new(None));
+            let mut candado = db
+                .clone()
+                .try_lock_owned()
+                .expect("nadie más usa la base todavía");
+            app.manage(AppState { db });
 
-            app.manage(AppState {
-                db: Mutex::new(base),
-            });
+            let dir_hilo = dir.clone();
+            std::thread::Builder::new()
+                .name("abrir-base".into())
+                .stack_size(16 * 1024 * 1024)
+                .spawn(move || {
+                    let dir = dir_hilo;
+                    *candado = if let Some(config) = nube::leer_config(&dir) {
+                        match tauri::async_runtime::block_on(abrir_base_nube(&dir, &config)) {
+                            Ok(base) => Some(base),
+                            Err(e) => {
+                                eprintln!("No se pudo abrir la base de la nube: {}", e);
+                                None
+                            }
+                        }
+                    } else {
+                        buscar_base_existente(&dir).and_then(|ruta| {
+                            match tauri::async_runtime::block_on(abrir_base_de_datos(ruta)) {
+                                Ok(base) => Some(base),
+                                Err(e) => {
+                                    eprintln!("No se pudo abrir la base de datos SQLite: {}", e);
+                                    None
+                                }
+                            }
+                        })
+                    };
+                    // Al soltar el candado, los comandos que esperaban ya ven la base
+                })
+                .expect("no se pudo crear el hilo para abrir la base de datos");
 
             // La ventana arranca oculta ("visible": false) y el frontend la muestra cuando ya pintó
             // con el tema correcto (evita el destello blanco). Por seguridad, si el frontend falla y
@@ -2888,6 +3182,9 @@ pub fn run() {
             obtener_configuracion_db,
             crear_base_de_datos,
             eliminar_base_de_datos,
+            conectar_nube,
+            sincronizar_nube,
+            comprobar_conexion_nube,
             obtener_copias_seguridad,
             crear_copia_seguridad,
             eliminar_copia_seguridad,

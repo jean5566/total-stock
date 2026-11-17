@@ -19,6 +19,8 @@ import { CLAVES_AJUSTES, useAjustes, type Ajustes } from "@/hooks/use-ajustes";
 import type { InfoBaseDatos } from "@/views/configurar-base-datos";
 import { CopiasSeguridadCard } from "@/components/copias-seguridad";
 import { DatosNegocioCard } from "@/components/datos-negocio";
+import { NubeCard } from "@/components/nube-card";
+import { useConexion } from "@/hooks/use-conexion";
 
 interface ConfiguracionViewProps {
   info: InfoBaseDatos | null;
@@ -59,6 +61,7 @@ function BotonMostrarMas({ abierto, onClick }: { abierto: boolean; onClick: () =
 
 export function ConfiguracionView({ info, onBaseEliminada, onBaseRestaurada }: ConfiguracionViewProps) {
   const { ajustes, setAjustes, cargado } = useAjustes();
+  const { sinConexion } = useConexion();
   const [guardando, setGuardando] = useState(false);
   const [error, setError] = useState("");
   const [verDetalleCatalogo, setVerDetalleCatalogo] = useState(false);
@@ -96,7 +99,19 @@ export function ConfiguracionView({ info, onBaseEliminada, onBaseRestaurada }: C
     }
   };
 
+  // Después de restaurar una copia, conectar o sincronizar con la nube: los datos pudieron cambiar
+  const recargarTodo = (nuevaInfo: InfoBaseDatos) => {
+    onBaseRestaurada(nuevaInfo);
+    setVersionDatos((v) => v + 1);
+    invoke<Ajustes>("obtener_ajustes")
+      .then(setAjustes)
+      .catch((err) => console.error("Error al recargar ajustes:", err));
+  };
+
+  const enNube = Boolean(info?.enNube);
+
   const cambiarAjuste = async (ajuste: keyof Ajustes, activo: boolean) => {
+    if (sinConexion) return;
     setGuardando(true);
     setError("");
     try {
@@ -141,7 +156,7 @@ export function ConfiguracionView({ info, onBaseEliminada, onBaseRestaurada }: C
               <Switch
                 id={`ajuste-${campo.ajuste}`}
                 checked={ajustes[campo.ajuste]}
-                disabled={!cargado || guardando}
+                disabled={!cargado || guardando || sinConexion}
                 onCheckedChange={(activo) => cambiarAjuste(campo.ajuste, activo)}
               />
             </div>
@@ -150,16 +165,9 @@ export function ConfiguracionView({ info, onBaseEliminada, onBaseRestaurada }: C
         </CardContent>
       </Card>
 
-      <CopiasSeguridadCard
-        onRestaurada={(nuevaInfo) => {
-          onBaseRestaurada(nuevaInfo);
-          setVersionDatos((v) => v + 1);
-          // Los ajustes también vienen de la copia restaurada
-          invoke<Ajustes>("obtener_ajustes")
-            .then(setAjustes)
-            .catch((err) => console.error("Error al recargar ajustes:", err));
-        }}
-      />
+      <NubeCard info={info} onCambio={recargarTodo} />
+
+      <CopiasSeguridadCard onRestaurada={recargarTodo} />
 
       <Card>
         <CardHeader className="flex flex-row items-center justify-between">
@@ -176,7 +184,7 @@ export function ConfiguracionView({ info, onBaseEliminada, onBaseRestaurada }: C
             </span>
             <Button type="button" size="sm" onClick={abrirEliminar} disabled={!info} className={BOTON_ROJO}>
               <Trash2 className="h-4 w-4" />
-              Eliminar
+              {enNube ? "Desconectar" : "Eliminar"}
             </Button>
           </div>
 
@@ -189,14 +197,16 @@ export function ConfiguracionView({ info, onBaseEliminada, onBaseRestaurada }: C
               <dd className="font-medium">{info.totalProductos}</dd>
 
               <dt className="text-muted-foreground">Tipo</dt>
-              <dd className="font-medium">SQLite</dd>
+              <dd className="font-medium">{enNube ? "Turso (nube) con copia local" : "SQLite"}</dd>
 
-              <dt className="text-muted-foreground">Archivo</dt>
+              <dt className="text-muted-foreground">{enNube ? "Copia local" : "Archivo"}</dt>
               <dd className="break-all font-mono text-xs">{info.ruta}</dd>
 
-              <dt className="text-muted-foreground">Eliminar</dt>
+              <dt className="text-muted-foreground">{enNube ? "Desconectar" : "Eliminar"}</dt>
               <dd className="text-xs text-muted-foreground">
-                Borra productos, inventario, ventas, clientes y ajustes. No se puede deshacer.
+                {enNube
+                  ? "Quita la base solo de este dispositivo. Los datos siguen en la nube y en tus otros dispositivos."
+                  : "Borra productos, inventario, ventas, clientes y ajustes. No se puede deshacer."}
               </dd>
             </dl>
           )}
@@ -215,9 +225,13 @@ export function ConfiguracionView({ info, onBaseEliminada, onBaseRestaurada }: C
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2 text-destructive">
               <AlertTriangle className="h-4 w-4" />
-              ¿Eliminar la base de datos?
+              {enNube ? "¿Desconectar este dispositivo?" : "¿Eliminar la base de datos?"}
             </DialogTitle>
-            <DialogDescription>Se borrará todo. No se puede deshacer.</DialogDescription>
+            <DialogDescription>
+              {enNube
+                ? "Los datos siguen en la nube; podrás volver a conectarte con la URL y el token."
+                : "Se borrará todo. No se puede deshacer."}
+            </DialogDescription>
           </DialogHeader>
 
           <form onSubmit={eliminarBase} className="space-y-4" noValidate autoComplete="off">
@@ -251,7 +265,7 @@ export function ConfiguracionView({ info, onBaseEliminada, onBaseRestaurada }: C
                 Cancelar
               </Button>
               <Button type="submit" disabled={!confirmacionOk || eliminando} className={BOTON_ROJO}>
-                {eliminando ? "Eliminando..." : "Eliminar"}
+                {eliminando ? "Un momento..." : enNube ? "Desconectar" : "Eliminar"}
               </Button>
             </DialogFooter>
           </form>

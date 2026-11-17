@@ -35,6 +35,7 @@ import {
 } from "@/hooks/use-ventas-abiertas";
 import type { Cliente } from "@/components/cliente-form";
 import { placeholderBusqueda, useAjustes } from "@/hooks/use-ajustes";
+import { MENSAJE_SIN_CONEXION, useConexion } from "@/hooks/use-conexion";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -179,6 +180,8 @@ function calcularTotales(carrito: LineaCarrito[]) {
 }
 
 export function VentaView() {
+  // Sin internet no se puede registrar la venta en la nube (ver use-conexion)
+  const { sinConexion } = useConexion();
   // Búsqueda de productos
   const [busqueda, setBusqueda] = useState("");
   const { ajustes } = useAjustes();
@@ -513,6 +516,10 @@ export function VentaView() {
   });
 
   const cobrar = async () => {
+    if (sinConexion) {
+      setError(MENSAJE_SIN_CONEXION);
+      return;
+    }
     setError("");
     if (carrito.length === 0) {
       setError("Agrega al menos un producto a la venta.");
@@ -734,9 +741,10 @@ export function VentaView() {
           <Plus className="h-4 w-4" />
         </Button>
       </div>
-        <Button type="button" variant="ghost" size="sm" className="mb-1 shrink-0 text-muted-foreground" onClick={abrirHistorial}>
+        <Button type="button" variant="ghost" size="sm" className="mb-1 shrink-0 text-muted-foreground" onClick={abrirHistorial} aria-label="Historial de ventas">
           <History className="h-4 w-4" />
-          Historial de ventas
+          {/* En el teléfono solo el ícono, para dejar espacio a las pestañas */}
+          <span className="hidden sm:inline">Historial de ventas</span>
         </Button>
       </div>
 
@@ -980,7 +988,124 @@ export function VentaView() {
                   Busca un producto y elígelo de la lista (clic o Enter).
                 </p>
               ) : (
-                <div className="border rounded-md overflow-x-auto">
+                <>
+                {/* Teléfono: una tarjeta por producto con sus controles (la tabla no entra) */}
+                <ul className="divide-y rounded-md border md:hidden">
+                  {carrito.map((linea) => {
+                    const { producto, cantidad } = linea;
+                    const calc = calcularLinea(linea);
+                    return (
+                      <li key={producto.id} className="space-y-3 p-3">
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="min-w-0 uppercase">
+                            <div className="text-sm font-medium break-words">
+                              {producto.detalle}
+                              {usarMedida && producto.medida && <MedidaTag medida={producto.medida} />}
+                            </div>
+                            <div className="font-mono text-[11px] text-muted-foreground">
+                              {producto.codigo} · {ETIQUETAS_IVA[producto.iva] ?? producto.iva}
+                            </div>
+                            {usarAplicacion && producto.aplicacion && <AplicacionTexto aplicacion={producto.aplicacion} />}
+                          </div>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="icon-sm"
+                            className="shrink-0"
+                            onClick={() => cambiarCantidad(producto.id, 0)}
+                            aria-label={`Quitar ${producto.detalle} de la venta`}
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </Button>
+                        </div>
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="flex items-center gap-1">
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="icon-sm"
+                              disabled={cantidad <= 1}
+                              onClick={() => cambiarCantidad(producto.id, Math.max(1, cantidad - 1))}
+                              aria-label="Restar uno"
+                            >
+                              <Minus className="h-3 w-3" />
+                            </Button>
+                            <CantidadInput
+                              cantidad={cantidad}
+                              max={producto.stock}
+                              onCambiar={(n) => cambiarCantidad(producto.id, n)}
+                              aria-label={`Cantidad de ${producto.detalle}`}
+                            />
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="icon-sm"
+                              disabled={cantidad >= producto.stock}
+                              onClick={() => cambiarCantidad(producto.id, cantidad + 1)}
+                              aria-label="Sumar uno"
+                            >
+                              <Plus className="h-3 w-3" />
+                            </Button>
+                          </div>
+                          <div className="text-right">
+                            <div className="font-semibold tabular-nums">{formatear(calc.neto)}</div>
+                            {calc.descuento > 0 && (
+                              <div className="text-[11px] tabular-nums text-emerald-600 dark:text-emerald-400">
+                                −{formatear(calc.descuento)}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                        <div className="grid grid-cols-2 gap-2">
+                          <label className="space-y-1">
+                            <span className="text-[11px] text-muted-foreground">P. unit.</span>
+                            <Input
+                              type="number"
+                              step="0.01"
+                              min="0.01"
+                              inputMode="decimal"
+                              value={linea.precio}
+                              onChange={(e) => cambiarCampo(producto.id, "precio", e.target.value)}
+                              onBlur={() => normalizarCampo(producto.id, "precio")}
+                              onFocus={(e) => e.target.select()}
+                              className="h-8 text-right tabular-nums"
+                              aria-invalid={!calc.precioOk}
+                            />
+                            {calc.precioEditado && (
+                              <button
+                                type="button"
+                                className="text-[11px] text-primary"
+                                onClick={() => cambiarCampo(producto.id, "precio", producto.precio.toFixed(2))}
+                              >
+                                Lista: {formatear(aCentavos(producto.precio))}
+                              </button>
+                            )}
+                          </label>
+                          <label className="space-y-1">
+                            <span className="text-[11px] text-muted-foreground">Desc. $</span>
+                            <Input
+                              type="number"
+                              step="0.01"
+                              min="0"
+                              inputMode="decimal"
+                              placeholder="0.00"
+                              value={linea.descuento}
+                              onChange={(e) => cambiarCampo(producto.id, "descuento", e.target.value)}
+                              onBlur={() => normalizarCampo(producto.id, "descuento")}
+                              onFocus={(e) => e.target.select()}
+                              className="h-8 text-right tabular-nums"
+                              aria-invalid={!calc.descuentoOk}
+                            />
+                            {calc.errorDescuento && (
+                              <p className="text-[11px] text-destructive">{calc.errorDescuento}</p>
+                            )}
+                          </label>
+                        </div>
+                      </li>
+                    );
+                  })}
+                </ul>
+                <div className="hidden overflow-x-auto rounded-md border md:block">
                   <Table>
                     <TableHeader>
                       <TableRow>
@@ -1111,6 +1236,7 @@ export function VentaView() {
                     </TableBody>
                   </Table>
                 </div>
+                </>
               )}
             </CardContent>
           </Card>
@@ -1269,11 +1395,13 @@ export function VentaView() {
               className="w-full"
               size="lg"
               disabled={
+                sinConexion ||
                 cobrando || carrito.length === 0 || totales.lineasInvalidas > 0 || !pagoValido || cambioCentavos < 0
               }
               onClick={cobrar}
+              title={sinConexion ? MENSAJE_SIN_CONEXION : undefined}
             >
-              {cobrando ? "Registrando..." : `Cobrar ${formatear(porCobrar)}`}
+              {sinConexion ? "Sin conexión" : cobrando ? "Registrando..." : `Cobrar ${formatear(porCobrar)}`}
             </Button>
           </CardFooter>
         </Card>
@@ -1364,7 +1492,33 @@ export function VentaView() {
           {ventaSeleccionada ? (
             <div className="flex min-h-0 flex-1 flex-col gap-4">
               {/* La tabla se encoge y hace scroll; totales y botones quedan siempre visibles */}
-              <div className="min-h-32 flex-1 overflow-y-auto border rounded-md">
+              {/* Teléfono: lista en vez de tabla */}
+              <ul className="min-h-32 flex-1 divide-y overflow-y-auto rounded-md border md:hidden">
+                {detalleVenta.map((d) => (
+                  <li key={d.id} className="flex items-start justify-between gap-3 p-3">
+                    <div className="min-w-0 uppercase">
+                      <div className="text-sm font-medium break-words">
+                        {d.detalle}
+                        {d.medida && <MedidaTag medida={d.medida} />}
+                      </div>
+                      <div className="font-mono text-[11px] text-muted-foreground">
+                        {d.codigo} · {ETIQUETAS_IVA[d.iva] ?? d.iva}
+                      </div>
+                      <div className="text-xs text-muted-foreground normal-case">
+                        {d.cantidad} × {formatear(aCentavos(d.precioUnitario))}
+                        {d.descuento > 0 && ` · desc. −${formatear(aCentavos(d.descuento))}`}
+                      </div>
+                      {d.devuelto > 0 && (
+                        <div className="text-[11px] text-amber-600 normal-case dark:text-amber-400">
+                          Devuelto: {d.devuelto}
+                        </div>
+                      )}
+                    </div>
+                    <div className="shrink-0 text-sm font-semibold tabular-nums">{formatear(aCentavos(d.subtotal))}</div>
+                  </li>
+                ))}
+              </ul>
+              <div className="hidden min-h-32 flex-1 overflow-y-auto rounded-md border md:block">
                 <Table>
                   <TableHeader>
                     <TableRow>
@@ -1492,9 +1646,9 @@ export function VentaView() {
                 <Button
                   type="button"
                   variant="outline"
-                  disabled={detalleVenta.length === 0 || unidadesPorDevolver === 0}
+                  disabled={sinConexion || detalleVenta.length === 0 || unidadesPorDevolver === 0}
                   onClick={() => setDevolucionAbierta(true)}
-                  title={unidadesPorDevolver === 0 && detalleVenta.length > 0 ? "Ya se devolvió todo" : undefined}
+                  title={sinConexion ? MENSAJE_SIN_CONEXION : unidadesPorDevolver === 0 && detalleVenta.length > 0 ? "Ya se devolvió todo" : undefined}
                 >
                   <Undo2 className="h-4 w-4" />
                   Devolución / cambio
@@ -1507,7 +1661,36 @@ export function VentaView() {
             <p className="text-sm text-muted-foreground text-center py-4">Todavía no hay ventas registradas.</p>
           ) : (
             <div className="flex min-h-0 flex-1 flex-col gap-3">
-              <div className="min-h-32 flex-1 overflow-y-auto border rounded-md">
+              {/* Teléfono: lista en vez de tabla */}
+              <ul className="min-h-32 flex-1 divide-y overflow-y-auto rounded-md border md:hidden">
+                {paginaVentas.ventas.map((v) => (
+                  <li key={v.id}>
+                    <button
+                      type="button"
+                      onClick={() => verDetalle(v)}
+                      className="flex w-full items-start justify-between gap-3 p-3 text-left active:bg-muted/50"
+                    >
+                      <div className="min-w-0">
+                        <div className="truncate text-sm font-medium uppercase">
+                          {v.clienteNombre || <span className="normal-case text-muted-foreground">Consumidor final</span>}
+                        </div>
+                        <div className="text-[11px] text-muted-foreground">
+                          N.º {v.id} · {v.fecha} · {v.unidades} u.
+                        </div>
+                      </div>
+                      <div className="shrink-0 text-right text-sm font-semibold tabular-nums">
+                        {formatear(aCentavos(v.total))}
+                        {v.totalDevuelto > 0 && (
+                          <div className="text-[11px] font-normal text-amber-600 dark:text-amber-400">
+                            dev. −{formatear(aCentavos(v.totalDevuelto))}
+                          </div>
+                        )}
+                      </div>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+              <div className="hidden min-h-32 flex-1 overflow-y-auto rounded-md border md:block">
                 <Table>
                   <TableHeader>
                     <TableRow>
@@ -1540,7 +1723,7 @@ export function VentaView() {
                   </TableBody>
                 </Table>
               </div>
-              <div className="flex shrink-0 items-center justify-between">
+              <div className="flex shrink-0 flex-wrap items-center justify-between gap-2">
                 <p className="text-xs text-muted-foreground">
                   {paginaVentas.total} venta{paginaVentas.total === 1 ? "" : "s"} en total
                 </p>

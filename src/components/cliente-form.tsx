@@ -13,6 +13,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { aMayusculas } from "@/lib/utils";
+import { MENSAJE_SIN_CONEXION, useConexion } from "@/hooks/use-conexion";
 
 // Debe coincidir con el struct Cliente en src-tauri/src/lib.rs
 export interface Cliente {
@@ -79,6 +80,7 @@ interface ClienteFormDialogProps {
 }
 
 export function ClienteFormDialog({ open, onOpenChange, cliente, onGuardado, sugerencia }: ClienteFormDialogProps) {
+  const { sinConexion } = useConexion();
   const [tipo, setTipo] = useState<string>("CEDULA");
   const [identificacion, setIdentificacion] = useState("");
   const [nombre, setNombre] = useState("");
@@ -124,6 +126,7 @@ export function ClienteFormDialog({ open, onOpenChange, cliente, onGuardado, sug
 
   const guardar = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (sinConexion) return;
     if (!validar()) return;
     setGuardando(true);
     try {
@@ -267,7 +270,12 @@ export function ClienteFormDialog({ open, onOpenChange, cliente, onGuardado, sug
           </div>
 
           <DialogFooter className="-mx-0 -mb-0 border-t-0 bg-transparent p-0 pt-2">
-            <Button type="submit" className="w-full sm:w-auto" disabled={guardando}>
+            <Button
+              type="submit"
+              className="w-full sm:w-auto"
+              disabled={guardando || sinConexion}
+              title={sinConexion ? MENSAJE_SIN_CONEXION : undefined}
+            >
               {guardando ? "Guardando..." : cliente ? "Actualizar Cliente" : "Guardar Cliente"}
             </Button>
           </DialogFooter>

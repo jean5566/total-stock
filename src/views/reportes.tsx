@@ -417,7 +417,7 @@ export function ReportesView() {
 
         <div className="flex flex-wrap items-center gap-2">
           <Select value={preset} onValueChange={(v) => v && elegirPreset(v as Preset)}>
-            <SelectTrigger className="w-[160px]" aria-label="Período">
+            <SelectTrigger className="flex-1 sm:w-[160px] sm:flex-none" aria-label="Período">
               <CalendarRange className="h-3.5 w-3.5 text-muted-foreground" />
               <SelectValue>{(v: string) => PRESETS.find((p) => p.valor === v)?.etiqueta ?? "Período"}</SelectValue>
             </SelectTrigger>
@@ -429,13 +429,13 @@ export function ReportesView() {
               ))}
             </SelectContent>
           </Select>
-          <div className="flex items-center gap-1.5">
+          <div className="flex w-full items-center gap-1.5 sm:w-auto">
             <Input
               type="date"
               value={desde}
               max={hasta || undefined}
               onChange={(e) => cambiarFecha("desde", e.target.value)}
-              className="w-[140px]"
+              className="min-w-0 flex-1 sm:w-[140px] sm:flex-none"
               aria-label="Desde"
             />
             <span className="text-xs text-muted-foreground">a</span>
@@ -444,7 +444,7 @@ export function ReportesView() {
               value={hasta}
               min={desde || undefined}
               onChange={(e) => cambiarFecha("hasta", e.target.value)}
-              className="w-[140px]"
+              className="min-w-0 flex-1 sm:w-[140px] sm:flex-none"
               aria-label="Hasta"
             />
           </div>
