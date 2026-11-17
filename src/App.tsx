@@ -13,7 +13,8 @@ import { ReportesView } from "@/views/reportes";
 import { ConfiguracionView } from "@/views/configuracion";
 import { ConfigurarBaseDatosView, InfoBaseDatos } from "@/views/configurar-base-datos";
 import { reiniciarVentasAbiertas } from "@/hooks/use-ventas-abiertas";
-import { AvisoSinConexion, ConexionProvider } from "@/hooks/use-conexion";
+import { ConexionProvider } from "@/hooks/use-conexion";
+import { AvisoConexion } from "@/components/aviso-conexion";
 
 const SIDEBAR_STORAGE_KEY = "sidebar-abierto";
 
@@ -134,7 +135,7 @@ export default function App() {
             </div>
           </header>
 
-          <AvisoSinConexion />
+          <AvisoConexion />
 
           <div ref={mainRef} className="min-h-0 flex-1 overflow-y-auto overscroll-y-contain">
 

@@ -181,7 +181,7 @@ function calcularTotales(carrito: LineaCarrito[]) {
 
 export function VentaView() {
   // Sin internet no se puede registrar la venta en la nube (ver use-conexion)
-  const { sinConexion } = useConexion();
+  const { sinConexion, comprobar, refrescarPendientes, versionDatos } = useConexion();
   // Búsqueda de productos
   const [busqueda, setBusqueda] = useState("");
   const { ajustes } = useAjustes();
@@ -516,10 +516,6 @@ export function VentaView() {
   });
 
   const cobrar = async () => {
-    if (sinConexion) {
-      setError(MENSAJE_SIN_CONEXION);
-      return;
-    }
     setError("");
     if (carrito.length === 0) {
       setError("Agrega al menos un producto a la venta.");
@@ -537,20 +533,26 @@ export function VentaView() {
       setError("El monto recibido es menor al total.");
       return;
     }
+    if (sinConexion && creditoCambio) {
+      setError("Usar el crédito de un cambio necesita internet. Quita el crédito o espera a que vuelva la conexión.");
+      return;
+    }
 
     // Se recuerda qué pestaña se cobra, por si el usuario cambia de pestaña mientras se registra
     const idCobrada = idActiva;
     setCobrando(true);
     try {
-      const venta: Venta = await invoke("registrar_venta", {
-        items: carrito.map((l) => {
-          const calc = calcularLinea(l);
-          return { productoId: l.producto.id, cantidad: l.cantidad, precio: calc.precio / 100, descuento: calc.descuento / 100 };
-        }),
-        pago: pagoCentavos / 100,
-        clienteId: cliente?.id ?? null,
-        devolucionId: creditoCambio?.devolucionId ?? null,
+      const items = carrito.map((l) => {
+        const calc = calcularLinea(l);
+        return { productoId: l.producto.id, cantidad: l.cantidad, precio: calc.precio / 100, descuento: calc.descuento / 100 };
       });
+      const pago = pagoCentavos / 100;
+      const clienteId = cliente?.id ?? null;
+      // Sin internet la venta se guarda en este equipo (id 0) y se sube sola al volver la conexión
+      const venta: Venta = sinConexion
+        ? await invoke("registrar_venta_sin_conexion", { items, pago, clienteId })
+        : await invoke("registrar_venta", { items, pago, clienteId, devolucionId: creditoCambio?.devolucionId ?? null });
+      if (venta.id === 0) refrescarPendientes();
       setVentaRegistrada(venta);
       setAviso("");
       // La venta cobrada se cierra; si había otras abiertas se pasa a la siguiente.
@@ -559,7 +561,15 @@ export function VentaView() {
       setBusqueda("");
     } catch (err) {
       console.error("Error al registrar la venta:", err);
-      setError(typeof err === "string" ? err : "No se pudo registrar la venta.");
+      const mensaje = typeof err === "string" ? err : "No se pudo registrar la venta.";
+      if (!sinConexion && mensaje.includes("Revisa tu conexión")) {
+        // Se cortó internet justo al cobrar: no se reintenta solo (la venta podría haber llegado a
+        // la nube). Al comprobar se activa el modo sin conexión para volver a cobrar.
+        comprobar();
+        setError(`${mensaje} Revisa el historial antes de volver a cobrar, por si la venta sí se registró.`);
+      } else {
+        setError(mensaje);
+      }
       // El stock o los precios pudieron haber cambiado: refrescamos resultados y carritos
       buscar(busqueda);
       refrescarCarritos();
@@ -576,6 +586,12 @@ export function VentaView() {
       console.error("Error al cargar ventas:", err);
     }
   };
+
+  // Al subirse las ventas hechas sin conexión, el historial abierto se recarga para mostrarlas
+  useEffect(() => {
+    if (versionDatos > 0 && historialAbierto) cargarVentas(paginaVentas?.pagina ?? 1);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [versionDatos]);
 
   const abrirHistorial = () => {
     setVentaSeleccionada(null);
@@ -1395,13 +1411,12 @@ export function VentaView() {
               className="w-full"
               size="lg"
               disabled={
-                sinConexion ||
                 cobrando || carrito.length === 0 || totales.lineasInvalidas > 0 || !pagoValido || cambioCentavos < 0
               }
               onClick={cobrar}
-              title={sinConexion ? MENSAJE_SIN_CONEXION : undefined}
+              title={sinConexion ? "Sin internet: la venta se guarda en este equipo y se sube al volver la conexión." : undefined}
             >
-              {sinConexion ? "Sin conexión" : cobrando ? "Registrando..." : `Cobrar ${formatear(porCobrar)}`}
+              {cobrando ? "Registrando..." : `Cobrar ${formatear(porCobrar)}${sinConexion ? " (sin conexión)" : ""}`}
             </Button>
           </CardFooter>
         </Card>
@@ -1426,11 +1441,15 @@ export function VentaView() {
       >
         <DialogContent className="sm:max-w-sm">
           <DialogHeader>
-            <DialogTitle>Venta registrada</DialogTitle>
+            <DialogTitle>{ventaRegistrada?.id === 0 ? "Venta guardada sin conexión" : "Venta registrada"}</DialogTitle>
             <DialogDescription>
               {ventaRegistrada && (
                 <>
-                  Venta N.º {ventaRegistrada.id} · {ventaRegistrada.fecha}
+                  {ventaRegistrada.id === 0
+                    ? "Se subirá sola cuando vuelva internet"
+                    : `Venta N.º ${ventaRegistrada.id}`}
+                  {" · "}
+                  {ventaRegistrada.fecha}
                   {" · "}
                   {ventaRegistrada.clienteNombre || "Consumidor final"}
                 </>

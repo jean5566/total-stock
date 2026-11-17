@@ -50,6 +50,22 @@ pub fn olvidar(dir: &Path) {
     let _ = std::fs::remove_dir_all(dir.join(CARPETA));
 }
 
+// Ventas cobradas sin internet que todavía no se subieron a Turso (JSON, ver VentaPendiente en lib.rs).
+const ARCHIVO_VENTAS_PENDIENTES: &str = "ventas_pendientes.json";
+
+pub fn leer_ventas_pendientes(dir: &Path) -> String {
+    std::fs::read_to_string(dir.join(ARCHIVO_VENTAS_PENDIENTES)).unwrap_or_default()
+}
+
+// Se escribe en un archivo temporal y luego se renombra: si la app se cierra a mitad, queda el
+// archivo anterior completo y no uno cortado (se perderían ventas).
+pub fn guardar_ventas_pendientes(dir: &Path, datos: &str) -> Result<(), String> {
+    let temporal = dir.join(format!("{}.tmp", ARCHIVO_VENTAS_PENDIENTES));
+    std::fs::write(&temporal, datos)
+        .and_then(|_| std::fs::rename(&temporal, dir.join(ARCHIVO_VENTAS_PENDIENTES)))
+        .map_err(|e| format!("No se pudieron guardar las ventas sin conexión: {}", e))
+}
+
 pub fn leer_ventas_abiertas(dir: &Path) -> String {
     std::fs::read_to_string(dir.join(ARCHIVO_VENTAS_ABIERTAS)).unwrap_or_default()
 }

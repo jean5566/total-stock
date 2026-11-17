@@ -331,6 +331,14 @@ async fn crear_esquema(conn: &Connection) -> libsql::Result<()> {
         (),
     )
     .await?;
+    // Ventas hechas sin conexión: su código evita subir la misma venta dos veces.
+    asegurar_columna(conn, "ventas", "codigo_offline", "TEXT").await?;
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_ventas_codigo_offline ON ventas (codigo_offline)
+         WHERE codigo_offline IS NOT NULL",
+        (),
+    )
+    .await?;
 
     conn.execute(
         "INSERT INTO configuracion (clave, valor) VALUES ('esquema_version', ?1)
@@ -345,7 +353,7 @@ async fn crear_esquema(conn: &Connection) -> libsql::Result<()> {
 // Con la nube, cada sentencia de crear_esquema viaja a Turso (es lenta y necesita internet), así que
 // al abrir solo se ejecuta si la copia local tiene otra versión. SÚBELA cada vez que cambies
 // crear_esquema (tablas, columnas o índices nuevos).
-const VERSION_ESQUEMA: &str = "1";
+const VERSION_ESQUEMA: &str = "2";
 
 async fn esquema_al_dia(conn: &Connection) -> bool {
     matches!(
@@ -901,6 +909,15 @@ async fn eliminar_base_de_datos(
     }
 
     let mut guard = state.db.lock().await;
+    if guard.as_ref().is_some_and(|b| b.nube) {
+        let pendientes = leer_ventas_pendientes(&directorio_datos(&app)?).len();
+        if pendientes > 0 {
+            return Err(format!(
+                "Hay {} venta(s) hechas sin conexión que aún no se subieron a la nube. Conéctate a internet para subirlas antes de desconectar.",
+                pendientes
+            ));
+        }
+    }
     let base = guard
         .take()
         .ok_or_else(|| "La base de datos no está configurada.".to_string())?;
@@ -1516,10 +1533,22 @@ async fn registrar_movimiento(
     cantidad: i32,
     stock_resultante: i32,
 ) -> libsql::Result<()> {
+    registrar_movimiento_en_fecha(conn, producto_id, tipo, cantidad, stock_resultante, None).await
+}
+
+// `fecha` = None usa la hora actual; las ventas sin conexión pasan la hora real de la venta.
+async fn registrar_movimiento_en_fecha(
+    conn: &Connection,
+    producto_id: i64,
+    tipo: &str,
+    cantidad: i32,
+    stock_resultante: i32,
+    fecha: Option<&str>,
+) -> libsql::Result<()> {
     conn.execute(
         "INSERT INTO movimientos_stock (producto_id, tipo, cantidad, stock_resultante, fecha)
-         VALUES (?1, ?2, ?3, ?4, datetime('now', 'localtime'))",
-        params![producto_id, tipo, cantidad, stock_resultante],
+         VALUES (?1, ?2, ?3, ?4, COALESCE(?5, datetime('now', 'localtime')))",
+        params![producto_id, tipo, cantidad, stock_resultante, fecha],
     )
     .await?;
     Ok(())
@@ -1745,7 +1774,7 @@ async fn eliminar_producto(
 // Ventas
 // ---------------------------------------------------------------------------------------------
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct ItemVenta {
     producto_id: i64,
@@ -1919,26 +1948,15 @@ async fn obtener_productos_por_ids(
         .map_err(|e| e.to_string())
 }
 
-// Registra una venta completa en una sola transacción: valida stock, calcula importes con los
-// precios actuales de la base (no con los que manda el frontend), descuenta stock y deja el
-// movimiento en el historial de cada producto. Si algo falla, no se guarda nada.
-#[tauri::command]
-async fn registrar_venta(
-    state: tauri::State<'_, AppState>,
-    items: Vec<ItemVenta>,
-    pago: f64,
-    cliente_id: Option<i64>,
-    // Cambio de producto: devolución (con reembolso CAMBIO, aún sin usar) cuyo total se descuenta
-    // de lo que paga el cliente. Si el crédito supera el total, la diferencia se le entrega como cambio.
-    devolucion_id: Option<i64>,
-) -> Result<Venta, String> {
+// Validaciones de la venta que no necesitan la base.
+fn validar_items_venta(items: &[ItemVenta], pago: f64) -> Result<(), String> {
     if items.is_empty() {
         return Err("Agrega al menos un producto a la venta.".to_string());
     }
 
     // Cada producto va una sola vez (con su propio precio y descuento).
     let mut vistos: Vec<i64> = Vec::new();
-    for item in &items {
+    for item in items {
         if item.cantidad <= 0 {
             return Err("Las cantidades deben ser mayores a 0.".to_string());
         }
@@ -1957,54 +1975,91 @@ async fn registrar_venta(
     if !pago.is_finite() || pago < 0.0 {
         return Err("Ingresa un monto de pago válido.".to_string());
     }
+    Ok(())
+}
 
-    let guard = state.db.lock().await;
-    let conn = requerir_conexion(&guard)?;
-    let tx = conn.transaction().await.map_err(|e| e.to_string())?;
+// Cómo se calcula una venta según cuándo se registra.
+enum ModoVenta<'a> {
+    // Venta normal: el stock debe alcanzar y el cliente debe existir.
+    EnLinea,
+    // Venta sin internet: se valida contra la copia local, descontando del stock lo que ya se vendió
+    // en otras ventas sin conexión que todavía no se subieron (producto_id -> unidades).
+    SinConexion(&'a std::collections::HashMap<i64, i32>),
+    // Subida de una venta hecha sin conexión: la venta ya ocurrió, así que se registra aunque el stock
+    // quede negativo, y si el cliente se borró mientras tanto se registra sin cliente.
+    Subida,
+}
 
+struct LineaVenta {
+    producto_id: i64,
+    codigo: String,
+    detalle: String,
+    medida: String,
+    cantidad: i32,
+    precio_lista_centavos: i64,
+    precio_centavos: i64,
+    descuento_pct: f64,
+    descuento_centavos: i64,
+    iva: String,
+    subtotal_centavos: i64,
+    stock: i32,
+}
+
+// Venta ya calculada (importes con los precios de la base y líneas), lista para guardarse.
+struct CalculoVenta {
+    cliente: Option<(i64, String, String)>,
+    lineas: Vec<LineaVenta>,
+    sub_cero: i64,
+    sub_iva5: i64,
+    sub_iva15: i64,
+    iva5: i64,
+    iva15: i64,
+    total: i64,
+    pago_centavos: i64,
+    cambio: i64,
+    credito: i64,
+    descuento_total: i64,
+    devolucion_id: Option<i64>,
+}
+
+// Calcula la venta leyendo productos y cliente de la base. No escribe nada.
+async fn calcular_venta(
+    conn: &Connection,
+    items: &[ItemVenta],
+    pago: f64,
+    cliente_id: Option<i64>,
+    devolucion_id: Option<i64>,
+    modo: ModoVenta<'_>,
+) -> Result<CalculoVenta, String> {
     // Cliente opcional: si viene, debe existir. Se guarda una copia de su nombre e identificación.
     let cliente: Option<(i64, String, String)> = match cliente_id {
         None => None,
         Some(id) => {
             let encontrado = una_fila(
-                &tx,
+                conn,
                 "SELECT id, nombre, identificacion FROM clientes WHERE id = ?1",
                 params![id],
                 |row| Ok((row.col(0)?, row.col(1)?, row.col(2)?)),
             )
             .await
             .map_err(|e| e.to_string())?;
-            match encontrado {
-                Some(c) => Some(c),
-                None => return Err("El cliente seleccionado ya no existe.".to_string()),
+            match (encontrado, &modo) {
+                (Some(c), _) => Some(c),
+                (None, ModoVenta::Subida) => None,
+                (None, _) => return Err("El cliente seleccionado ya no existe.".to_string()),
             }
         }
     };
-
-    struct Linea {
-        producto_id: i64,
-        codigo: String,
-        detalle: String,
-        medida: String,
-        cantidad: i32,
-        precio_lista_centavos: i64,
-        precio_centavos: i64,
-        descuento_pct: f64,
-        descuento_centavos: i64,
-        iva: String,
-        subtotal_centavos: i64,
-        stock: i32,
-    }
 
     let mut lineas = Vec::new();
     let (mut sub_cero, mut sub_iva5, mut sub_iva15) = (0i64, 0i64, 0i64);
     let mut descuento_total = 0i64;
 
-    for item in &items {
+    for item in items {
         let producto_id = item.producto_id;
         let cantidad = item.cantidad;
         let producto = una_fila(
-            &tx,
+            conn,
             "SELECT codigo, detalle, precio, iva, stock, medida FROM productos WHERE id = ?1",
             params![producto_id],
             |row| {
@@ -2025,11 +2080,19 @@ async fn registrar_venta(
             return Err("Uno de los productos de la venta ya no existe.".to_string());
         };
 
-        if cantidad > stock {
-            return Err(format!(
-                "No hay suficiente stock de {} (disponible: {}).",
-                detalle, stock
-            ));
+        let disponible = match &modo {
+            ModoVenta::EnLinea => Some(stock),
+            ModoVenta::SinConexion(reservado) => Some(stock - reservado.get(&producto_id).copied().unwrap_or(0)),
+            ModoVenta::Subida => None,
+        };
+        if let Some(disponible) = disponible {
+            if cantidad > disponible {
+                return Err(format!(
+                    "No hay suficiente stock de {} (disponible: {}).",
+                    detalle,
+                    disponible.max(0)
+                ));
+            }
         }
 
         // El precio de lista es el del catálogo; el cobrado es el que se editó en la venta.
@@ -2061,7 +2124,7 @@ async fn registrar_venta(
             _ => sub_cero += subtotal_centavos,
         }
 
-        lineas.push(Linea {
+        lineas.push(LineaVenta {
             producto_id,
             codigo,
             detalle,
@@ -2084,7 +2147,7 @@ async fn registrar_venta(
 
     let credito = match devolucion_id {
         None => 0,
-        Some(id) => credito_disponible(&tx, id).await?,
+        Some(id) => credito_disponible(conn, id).await?,
     };
 
     if pago_centavos + credito < total {
@@ -2096,33 +2159,62 @@ async fn registrar_venta(
     }
     let cambio = pago_centavos + credito - total;
 
-    tx.execute(
+    Ok(CalculoVenta {
+        cliente,
+        lineas,
+        sub_cero,
+        sub_iva5,
+        sub_iva15,
+        iva5,
+        iva15,
+        total,
+        pago_centavos,
+        cambio,
+        credito,
+        descuento_total,
+        devolucion_id,
+    })
+}
+
+// Guarda la venta calculada: cabecera, líneas, descuento de stock y movimientos. Debe llamarse
+// dentro de una transacción. `fecha` y `codigo_offline` vienen solo de las ventas sin conexión
+// (la fecha real de la venta y su código único para no subirla dos veces).
+async fn guardar_venta(
+    conn: &Connection,
+    calculo: &CalculoVenta,
+    fecha: Option<&str>,
+    codigo_offline: Option<&str>,
+) -> Result<i64, String> {
+    let cliente = &calculo.cliente;
+    conn.execute(
         "INSERT INTO ventas (fecha, subtotal_cero, subtotal_iva5, subtotal_iva15, iva5, iva15, total, pago, cambio, descuento,
-                             cliente_id, cliente_nombre, cliente_identificacion, devolucion_id, credito)
-         VALUES (datetime('now', 'localtime'), ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                             cliente_id, cliente_nombre, cliente_identificacion, devolucion_id, credito, codigo_offline)
+         VALUES (COALESCE(?15, datetime('now', 'localtime')), ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?16)",
         params![
-            de_centavos(sub_cero),
-            de_centavos(sub_iva5),
-            de_centavos(sub_iva15),
-            de_centavos(iva5),
-            de_centavos(iva15),
-            de_centavos(total),
-            de_centavos(pago_centavos),
-            de_centavos(cambio),
-            de_centavos(descuento_total),
+            de_centavos(calculo.sub_cero),
+            de_centavos(calculo.sub_iva5),
+            de_centavos(calculo.sub_iva15),
+            de_centavos(calculo.iva5),
+            de_centavos(calculo.iva15),
+            de_centavos(calculo.total),
+            de_centavos(calculo.pago_centavos),
+            de_centavos(calculo.cambio),
+            de_centavos(calculo.descuento_total),
             cliente.as_ref().map(|c| c.0),
             cliente.as_ref().map(|c| c.1.clone()).unwrap_or_default(),
             cliente.as_ref().map(|c| c.2.clone()).unwrap_or_default(),
-            devolucion_id,
-            de_centavos(credito),
+            calculo.devolucion_id,
+            de_centavos(calculo.credito),
+            fecha,
+            codigo_offline,
         ],
     )
     .await
     .map_err(|e| e.to_string())?;
-    let venta_id = tx.last_insert_rowid();
+    let venta_id = conn.last_insert_rowid();
 
-    for linea in &lineas {
-        tx.execute(
+    for linea in &calculo.lineas {
+        conn.execute(
             "INSERT INTO venta_detalle (venta_id, producto_id, codigo, detalle, cantidad, precio_unitario, iva, subtotal, medida,
                                         precio_lista, descuento_pct, descuento)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
@@ -2144,23 +2236,373 @@ async fn registrar_venta(
         .await
         .map_err(|e| e.to_string())?;
 
-        tx.execute(
+        conn.execute(
             "UPDATE productos SET stock = stock - ?1 WHERE id = ?2",
             params![linea.cantidad, linea.producto_id],
         )
         .await
         .map_err(|e| e.to_string())?;
 
-        registrar_movimiento(&tx, linea.producto_id, "VENTA", linea.cantidad, linea.stock - linea.cantidad)
-            .await
-            .map_err(|e| e.to_string())?;
+        registrar_movimiento_en_fecha(
+            conn,
+            linea.producto_id,
+            "VENTA",
+            linea.cantidad,
+            linea.stock - linea.cantidad,
+            fecha,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
     }
+    Ok(venta_id)
+}
 
-    tx.commit().await.map_err(|e| e.to_string())?;
+// Registra una venta completa en una sola transacción: valida stock, calcula importes con los
+// precios actuales de la base (no con los que manda el frontend), descuenta stock y deja el
+// movimiento en el historial de cada producto. Si algo falla, no se guarda nada.
+#[tauri::command]
+async fn registrar_venta(
+    state: tauri::State<'_, AppState>,
+    items: Vec<ItemVenta>,
+    pago: f64,
+    cliente_id: Option<i64>,
+    // Cambio de producto: devolución (con reembolso CAMBIO, aún sin usar) cuyo total se descuenta
+    // de lo que paga el cliente. Si el crédito supera el total, la diferencia se le entrega como cambio.
+    devolucion_id: Option<i64>,
+) -> Result<Venta, String> {
+    validar_items_venta(&items, pago)?;
+
+    let guard = state.db.lock().await;
+    let conn = requerir_conexion(&guard)?;
+    // Si la app se abrió sin internet, el esquema de la nube pudo quedar sin actualizar (falta
+    // codigo_offline): se actualiza ahora, antes de la primera venta.
+    if !esquema_al_dia(conn).await {
+        crear_esquema(conn).await.map_err(nube::mensaje_error)?;
+    }
+    let guardado: Result<i64, String> = async {
+        let tx = conn.transaction().await.map_err(|e| e.to_string())?;
+        let calculo = calcular_venta(&tx, &items, pago, cliente_id, devolucion_id, ModoVenta::EnLinea).await?;
+        let venta_id = guardar_venta(&tx, &calculo, None, None).await?;
+        tx.commit().await.map_err(|e| e.to_string())?;
+        Ok(venta_id)
+    }
+    .await;
+    // Si se cortó internet, mensaje claro ("Revisa tu conexión"): el frontend pasa a modo sin conexión
+    let venta_id = guardado.map_err(|e| if es_error_de_red(&e) { nube::mensaje_error(e) } else { e })?;
 
     fila(conn, &format!("{} WHERE v.id = ?1", SELECT_VENTA), params![venta_id], mapear_venta)
         .await
         .map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Ventas sin conexión (solo con la base en la nube)
+// ---------------------------------------------------------------------------------------------
+
+// Venta hecha sin internet que espera a subirse a Turso (ver nube::leer_ventas_pendientes).
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct VentaPendiente {
+    // Código único: si la subida se corta después de guardar en la nube, evita subirla dos veces.
+    codigo: String,
+    // Fecha y hora reales de la venta (no la de la subida).
+    fecha: String,
+    items: Vec<ItemVenta>,
+    pago: f64,
+    cliente_id: Option<i64>,
+    // Copia de lo calculado al vender, para mostrar la lista sin volver a calcular.
+    total: f64,
+    cambio: f64,
+    unidades: i64,
+    cliente_nombre: String,
+    // Motivo por el que no se pudo subir (p. ej. un producto que se borró). Se sigue guardando
+    // hasta que se reintente con éxito o el usuario la descarte.
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResultadoSubida {
+    subidas: usize,
+    // Productos que quedaron con stock negativo al subir (se vendió más de lo que había).
+    stock_negativo: Vec<String>,
+    pendientes: Vec<VentaPendiente>,
+}
+
+fn leer_ventas_pendientes(dir: &std::path::Path) -> Vec<VentaPendiente> {
+    serde_json::from_str(&nube::leer_ventas_pendientes(dir)).unwrap_or_default()
+}
+
+fn guardar_ventas_pendientes(dir: &std::path::Path, pendientes: &[VentaPendiente]) -> Result<(), String> {
+    let texto = serde_json::to_string(pendientes).map_err(|e| e.to_string())?;
+    nube::guardar_ventas_pendientes(dir, &texto)
+}
+
+// Código único para una venta sin conexión: momento exacto + número aleatorio.
+fn codigo_venta_offline() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let azar = std::collections::hash_map::RandomState::new();
+    let extra = std::hash::BuildHasher::hash_one(&azar, nanos);
+    format!("{:x}-{:x}", nanos, extra)
+}
+
+// Guarda una venta hecha sin internet en este dispositivo. Se valida igual que una venta normal
+// (precios de la base, stock descontando las otras ventas pendientes) y se subirá a la nube con
+// subir_ventas_pendientes. No admite crédito de devolución: usarlo necesita la nube.
+#[tauri::command]
+async fn registrar_venta_sin_conexion(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    items: Vec<ItemVenta>,
+    pago: f64,
+    cliente_id: Option<i64>,
+) -> Result<Venta, String> {
+    validar_items_venta(&items, pago)?;
+
+    let guard = state.db.lock().await;
+    let base = guard
+        .as_ref()
+        .filter(|b| b.nube)
+        .ok_or_else(|| "Las ventas sin conexión solo se usan con la base en la nube.".to_string())?;
+    let conn = &base.conn;
+    let dir = directorio_datos(&app)?;
+    let mut pendientes = leer_ventas_pendientes(&dir);
+
+    let mut reservado = std::collections::HashMap::new();
+    for item in pendientes.iter().flat_map(|p| &p.items) {
+        *reservado.entry(item.producto_id).or_insert(0) += item.cantidad;
+    }
+    let calculo =
+        calcular_venta(conn, &items, pago, cliente_id, None, ModoVenta::SinConexion(&reservado)).await?;
+    let fecha: String = fila(conn, "SELECT datetime('now', 'localtime')", (), |row| row.col(0))
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let cliente = calculo.cliente.clone();
+    let pendiente = VentaPendiente {
+        codigo: codigo_venta_offline(),
+        fecha: fecha.clone(),
+        items,
+        pago,
+        cliente_id: cliente.as_ref().map(|c| c.0),
+        total: de_centavos(calculo.total),
+        cambio: de_centavos(calculo.cambio),
+        unidades: calculo.lineas.iter().map(|l| l.cantidad as i64).sum(),
+        cliente_nombre: cliente.as_ref().map(|c| c.1.clone()).unwrap_or_default(),
+        error: None,
+    };
+    pendientes.push(pendiente.clone());
+    guardar_ventas_pendientes(&dir, &pendientes)?;
+
+    // Mismo formato que una venta registrada, para mostrar el comprobante. Id 0 = aún sin número.
+    Ok(Venta {
+        id: 0,
+        fecha,
+        subtotal_cero: de_centavos(calculo.sub_cero),
+        subtotal_iva5: de_centavos(calculo.sub_iva5),
+        subtotal_iva15: de_centavos(calculo.sub_iva15),
+        iva5: de_centavos(calculo.iva5),
+        iva15: de_centavos(calculo.iva15),
+        total: pendiente.total,
+        pago: de_centavos(calculo.pago_centavos),
+        cambio: pendiente.cambio,
+        unidades: pendiente.unidades,
+        descuento: de_centavos(calculo.descuento_total),
+        cliente_nombre: pendiente.cliente_nombre,
+        cliente_identificacion: cliente.map(|c| c.2).unwrap_or_default(),
+        total_devuelto: 0.0,
+        credito: 0.0,
+        devolucion_id: None,
+    })
+}
+
+#[tauri::command]
+fn obtener_ventas_pendientes(app: tauri::AppHandle) -> Result<Vec<VentaPendiente>, String> {
+    Ok(leer_ventas_pendientes(&directorio_datos(&app)?))
+}
+
+// Quita una venta pendiente sin subirla (para las que no se pueden subir, p. ej. producto borrado).
+#[tauri::command]
+async fn descartar_venta_pendiente(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    codigo: String,
+) -> Result<Vec<VentaPendiente>, String> {
+    let _guard = state.db.lock().await;
+    let dir = directorio_datos(&app)?;
+    let mut pendientes = leer_ventas_pendientes(&dir);
+    pendientes.retain(|p| p.codigo != codigo);
+    guardar_ventas_pendientes(&dir, &pendientes)?;
+    Ok(pendientes)
+}
+
+// true si el error es de red (hay que parar y reintentar luego), no un problema de la venta.
+fn es_error_de_red(mensaje: &str) -> bool {
+    let m = mensaje.to_lowercase();
+    ["dns", "connect", "timed out", "network", "sync error", "http", "hrana", "stream"]
+        .iter()
+        .any(|p| m.contains(p))
+}
+
+// Sube a la nube las ventas hechas sin conexión, en el orden en que se hicieron. Cada una va en su
+// propia transacción y se quita del archivo apenas se guarda. Si se corta internet a mitad, las que
+// faltan quedan para la próxima. Las que fallan por otro motivo quedan marcadas con el error.
+#[tauri::command]
+async fn subir_ventas_pendientes(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<ResultadoSubida, String> {
+    let guard = state.db.lock().await;
+    let dir = directorio_datos(&app)?;
+    let mut pendientes = leer_ventas_pendientes(&dir);
+    let mut resultado = ResultadoSubida { subidas: 0, stock_negativo: Vec::new(), pendientes: Vec::new() };
+    let Some(base) = guard.as_ref().filter(|b| b.nube) else {
+        resultado.pendientes = pendientes;
+        return Ok(resultado);
+    };
+    if pendientes.is_empty() {
+        return Ok(resultado);
+    }
+
+    // Trae lo último de la nube: así se ve si alguna venta ya se había subido y el stock está al día.
+    match tokio::time::timeout(ESPERA_MAXIMA_NUBE, base.db.sync()).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => return Err(nube::mensaje_error(e)),
+        Err(_) => return Err("La nube tardó demasiado en responder. Revisa tu conexión a internet.".to_string()),
+    }
+    let conn = &base.conn;
+    // La columna codigo_offline puede faltar si la base se actualizó sin internet.
+    if !esquema_al_dia(conn).await {
+        crear_esquema(conn).await.map_err(nube::mensaje_error)?;
+    }
+
+    for codigo in pendientes.iter().map(|p| p.codigo.clone()).collect::<Vec<_>>() {
+        let Some(pos) = pendientes.iter().position(|p| p.codigo == codigo) else { continue };
+        let p = pendientes[pos].clone();
+
+        let ya_subida: Option<i64> = una_fila(
+            conn,
+            "SELECT id FROM ventas WHERE codigo_offline = ?1",
+            params![p.codigo.as_str()],
+            |row| row.col(0),
+        )
+        .await
+        .map_err(nube::mensaje_error)?;
+
+        if ya_subida.is_none() {
+            let intento: Result<Vec<String>, String> = async {
+                let tx = conn.transaction().await.map_err(|e| e.to_string())?;
+                let calculo = calcular_venta(&tx, &p.items, p.pago, p.cliente_id, None, ModoVenta::Subida).await?;
+                guardar_venta(&tx, &calculo, Some(&p.fecha), Some(&p.codigo)).await?;
+                tx.commit().await.map_err(|e| e.to_string())?;
+                Ok(calculo
+                    .lineas
+                    .iter()
+                    .filter(|l| l.stock - l.cantidad < 0)
+                    .map(|l| format!("{} ({})", l.detalle, l.stock - l.cantidad))
+                    .collect())
+            }
+            .await;
+
+            match intento {
+                Ok(negativos) => {
+                    resultado.subidas += 1;
+                    resultado.stock_negativo.extend(negativos);
+                }
+                Err(e) if es_error_de_red(&e) => {
+                    // Se para aquí: lo que falta se sube cuando vuelva la conexión
+                    guardar_ventas_pendientes(&dir, &pendientes)?;
+                    return Err(nube::mensaje_error(e));
+                }
+                Err(e) => {
+                    pendientes[pos].error = Some(e);
+                    guardar_ventas_pendientes(&dir, &pendientes)?;
+                    continue;
+                }
+            }
+        }
+        pendientes.remove(pos);
+        guardar_ventas_pendientes(&dir, &pendientes)?;
+    }
+
+    resultado.pendientes = pendientes;
+    Ok(resultado)
+}
+
+#[cfg(test)]
+mod pruebas_ventas_sin_conexion {
+    use super::*;
+
+    async fn base_con_producto(stock: i32) -> (libsql::Database, Connection) {
+        let db = libsql::Builder::new_local(":memory:").build().await.unwrap();
+        let conn = db.connect().unwrap();
+        crear_esquema(&conn).await.unwrap();
+        conn.execute(
+            "INSERT INTO productos (codigo, detalle, categoria, precio, iva, stock, medida, aplicacion)
+             VALUES ('A1', 'MARTILLO', 'HERRAMIENTAS', 10.0, 'SIN_IVA', ?1, '', '')",
+            params![stock],
+        )
+        .await
+        .unwrap();
+        (db, conn)
+    }
+
+    fn item(cantidad: i32) -> Vec<ItemVenta> {
+        vec![ItemVenta { producto_id: 1, cantidad, precio: 10.0, descuento: 0.0 }]
+    }
+
+    #[tokio::test]
+    async fn sin_conexion_descuenta_lo_ya_vendido_pendiente() {
+        let (_db, conn) = base_con_producto(5).await;
+        let mut reservado = std::collections::HashMap::new();
+        reservado.insert(1, 4);
+        // Quedan 5 en la base, pero 4 ya se vendieron sin conexión: solo alcanza 1
+        assert!(calcular_venta(&conn, &item(1), 10.0, None, None, ModoVenta::SinConexion(&reservado)).await.is_ok());
+        let error = calcular_venta(&conn, &item(2), 20.0, None, None, ModoVenta::SinConexion(&reservado))
+            .await
+            .err()
+            .unwrap();
+        assert!(error.contains("disponible: 1"), "{}", error);
+    }
+
+    #[tokio::test]
+    async fn la_subida_registra_aunque_falte_stock_con_fecha_y_codigo() {
+        let (_db, conn) = base_con_producto(1).await;
+        // Cliente borrado mientras tanto: se registra sin cliente
+        let calculo = calcular_venta(&conn, &item(3), 30.0, Some(99), None, ModoVenta::Subida).await.unwrap();
+        assert!(calculo.cliente.is_none());
+        let id = guardar_venta(&conn, &calculo, Some("2026-01-02 08:30:00"), Some("abc")).await.unwrap();
+
+        let (fecha, codigo): (String, String) = fila(
+            &conn,
+            "SELECT fecha, codigo_offline FROM ventas WHERE id = ?1",
+            params![id],
+            |r| Ok((r.col(0)?, r.col(1)?)),
+        )
+        .await
+        .unwrap();
+        assert_eq!((fecha.as_str(), codigo.as_str()), ("2026-01-02 08:30:00", "abc"));
+        let stock: i64 = fila(&conn, "SELECT stock FROM productos WHERE id = 1", (), |r| r.col(0)).await.unwrap();
+        assert_eq!(stock, -2);
+        let fecha_mov: String = fila(&conn, "SELECT fecha FROM movimientos_stock", (), |r| r.col(0)).await.unwrap();
+        assert_eq!(fecha_mov, "2026-01-02 08:30:00");
+
+        // El mismo código no se puede guardar dos veces
+        assert!(guardar_venta(&conn, &calculo, None, Some("abc")).await.is_err());
+        // En línea sí se exige stock
+        assert!(calcular_venta(&conn, &item(1), 10.0, None, None, ModoVenta::EnLinea).await.is_err());
+    }
+
+    #[test]
+    fn codigos_distintos_y_errores_de_red() {
+        assert_ne!(codigo_venta_offline(), codigo_venta_offline());
+        assert!(es_error_de_red("sync error: error trying to connect: dns error"));
+        assert!(!es_error_de_red("Uno de los productos de la venta ya no existe."));
+    }
 }
 
 // Historial de ventas paginado (más recientes primero), con el resumen del día.
@@ -3185,6 +3627,10 @@ pub fn run() {
             conectar_nube,
             sincronizar_nube,
             comprobar_conexion_nube,
+            registrar_venta_sin_conexion,
+            obtener_ventas_pendientes,
+            descartar_venta_pendiente,
+            subir_ventas_pendientes,
             obtener_copias_seguridad,
             crear_copia_seguridad,
             eliminar_copia_seguridad,
